@@ -75,10 +75,15 @@ function AdminDashboard() {
   };
 
   const updateStatus = (teamId, status) => {
+    // Optimistic UI update to avoid waiting for SSE roundtrip
+    setTeams(prev => prev.map(t => t.id === teamId ? { ...t, status } : t));
     fetch('/api/admin/status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ teamId, status })
+    }).catch(() => {
+        // Fallback: refetch if request fails
+        fetch('/api/teams').then(res => res.json()).then(setTeams);
     });
   };
 
@@ -175,8 +180,8 @@ function AdminDashboard() {
           </div>
           
           <div style={{ marginTop: '20px', display:'flex', gap:'10px', alignItems:'center', flexWrap:'wrap' }}>
-               <button className="btn" onClick={() => navigate('/admin/scoreboard')}>🏆 스코어보드 열기</button>
-               <button className="btn btn-secondary" onClick={() => navigate('/admin/booths')}>🏫 부스 관리 (정보 수정)</button>
+               <button className="btn btn-compact" onClick={() => navigate('/admin/scoreboard')}>🏆 스코어보드 열기</button>
+               <button className="btn btn-secondary btn-compact" onClick={() => navigate('/admin/booths')}>🏫 부스 관리</button>
                
                <div style={{marginLeft: 'auto', display:'flex', alignItems:'center', gap:'8px', background: 'rgba(255,255,255,0.05)', padding: '5px 10px', borderRadius:'8px'}}>
                     <span style={{fontSize:'0.8rem'}}>🧹 청소 알림 시간 설정:</span>

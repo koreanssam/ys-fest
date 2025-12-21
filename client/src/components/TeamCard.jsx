@@ -39,6 +39,11 @@ function TeamCard({ team, isLive }) {
   // Optimistic UI state
   const [votes, setVotes] = useState(team.vote_count);
   const [animate, setAnimate] = useState(false);
+  const [burst, setBurst] = useState([]);
+  const isDone = team.status === 'DONE';
+  const burstCountRef = useRef(0);
+  const cardRef = useRef(null);
+  const buttonRef = useRef(null);
 
   useEffect(() => {
     setVotes(team.vote_count);
@@ -51,6 +56,33 @@ function TeamCard({ team, isLive }) {
     setAnimate(true);
     setTimeout(() => setAnimate(false), 300);
 
+    // Heart burst (visual only)
+    const id = Date.now() + Math.random();
+    burstCountRef.current += 1;
+    const size = Math.min(22 + burstCountRef.current * 6, 64); // grows faster with rapid clicks, capped
+    const hue = 320 + Math.random() * 60; // wider pink-magenta range
+    const dx = (Math.random() - 0.5) * 140; // -70~70px scatter
+    const rot = (Math.random() - 0.5) * 60; // -30~30 deg
+    const scaleMid = Math.min(1.4 + size * 0.025, 3.0);
+    const scaleEnd = Math.min(1.1 + size * 0.018, 2.2);
+    const lifetime = 650;
+
+    // start offsets: button center relative to card center
+    let sx = 0;
+    let sy = 0;
+    if (cardRef.current && buttonRef.current) {
+      const cardRect = cardRef.current.getBoundingClientRect();
+      const btnRect = buttonRef.current.getBoundingClientRect();
+      sx = (btnRect.left + btnRect.width / 2) - (cardRect.left + cardRect.width / 2);
+      sy = (btnRect.top + btnRect.height / 2) - (cardRect.top + cardRect.height / 2);
+    }
+
+    setBurst(prev => [...prev, { id, size, hue, dx, rot, scaleMid, scaleEnd, sx, sy, rise: 220 }]);
+    setTimeout(() => {
+      setBurst(prev => prev.filter(b => b.id !== id));
+      burstCountRef.current = Math.max(0, burstCountRef.current - 1);
+    }, lifetime);
+
     // Queue vote
     if (!window.voteQueue[team.id]) window.voteQueue[team.id] = 0;
     window.voteQueue[team.id]++;
@@ -58,54 +90,68 @@ function TeamCard({ team, isLive }) {
 
 
   return (
-    <div className="card team-card" style={{ 
-        border: isLive ? '2px solid var(--accent-color)' : '1px solid var(--glass-border)',
-        transform: isLive ? 'scale(1.02)' : 'none',
-        boxShadow: isLive ? '0 0 20px var(--accent-glow)' : 'var(--shadow-card)',
-        marginBottom: '16px',
-        transition: 'all 0.3s ease'
-    }}>
-        <div style={{ position: 'relative' }}>
+    <div ref={cardRef} className={`card team-card ${isLive ? 'live' : ''} ${isDone ? 'done' : ''}`}>
+        <div className="burst-layer">
+            {burst.map(b => (
+              <span 
+                key={b.id} 
+                className="heart-pop-anim"
+                style={{
+                  color: `hsl(${b.hue || 340}, 85%, 65%)`,
+                  fontSize: `${b.size || 22}px`,
+                  '--dx': `${b.dx || 0}px`,
+                  '--rot': `${b.rot || 0}deg`,
+                  '--scaleMid': `${b.scaleMid || 1.6}`,
+                  '--scaleEnd': `${b.scaleEnd || 1.2}`,
+                  '--startX': `${b.sx || 0}px`,
+                  '--startY': `${b.sy || 0}px`,
+                  '--rise': `${b.rise || 220}px`
+                }}
+              >
+                ♥
+              </span>
+            ))}
+        </div>
+        <div>
             <img 
+                className="team-thumb"
                 src={team.image_url || "/images/coming-soon.svg"} 
                 alt={team.name} 
+                loading="lazy"
                 onError={(e) => { e.target.onerror = null; e.target.src = "/images/coming-soon.svg"; }}
-                style={{ width: '100%', borderRadius: 'var(--radius-md)', marginBottom: '12px', maxHeight: isLive ? '400px' : '150px', objectFit:'cover' }}
             />
-            {/* User requested removal of redundant badge. We only keep the text status below. */}
         </div>
         
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-            <div>
-                <span style={{ fontSize: '0.8rem', color: '#888', marginRight: '8px' }}>#{team.perf_order}</span>
-                <span style={{ 
-                    padding: '4px 8px', borderRadius: '4px', fontSize: '0.8rem', fontWeight: 'bold',
-                    background: team.category === 'GROUP' ? 'rgba(0,255,157,0.1)' : 'rgba(255,204,0,0.1)',
-                    color: team.category === 'GROUP' ? 'var(--success-color)' : 'var(--warning-color)'
-                }}>
+        <div className="meta-row">
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <span className="pill">#{team.perf_order}</span>
+                <span className={`chip ${team.category === 'GROUP' ? 'chip--success' : 'chip--warn'}`}>
                     {team.category === 'GROUP' ? '단체' : '개인'}
                 </span>
             </div>
-            {team.status === 'LIVE' && <span className="btn-pulse" style={{color:'red', fontSize:'0.8rem', fontWeight:'bold'}}>● 실시간 진행중</span>}
+            {team.status === 'LIVE' && <span className="status-dot btn-pulse">● LIVE</span>}
+            {isDone && <span className="pill">종료</span>}
         </div>
         
-        <h3 style={{ margin: '0 0 8px 0', fontSize: isLive ? '1.5rem' : '1.2rem' }}>{team.name}</h3>
-        <p style={{ margin: '0 0 16px 0', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+        <h3 style={{ margin: '4px 0 4px', fontSize: isLive ? '1.35rem' : '1.15rem' }}>{team.name}</h3>
+        <p className="muted" style={{ margin: '0 0 10px', lineHeight: 1.5 }}>
             {team.description}
         </p>
 
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ fontSize: '1.2rem', fontWeight: 'bold', color: 'var(--text-secondary)' }}>
-                {votes.toLocaleString()} <span style={{fontSize:'0.8rem'}}>표</span>
+        <div className="vote-row">
+            <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: 'var(--text-secondary)' }}>
+                {votes.toLocaleString()} <span className="small">표</span>
             </div>
             <button 
                 className={`btn ${animate ? 'heart-pop' : ''}`} 
                 onClick={handleVote}
                 disabled={team.status !== 'LIVE'}
+                ref={buttonRef}
                 style={{ 
-                    background: team.status === 'LIVE' ? 'var(--accent-color)' : '#444',
+                    background: team.status === 'LIVE' ? 'linear-gradient(135deg, var(--accent-grad-start), var(--accent-grad-end))' : 'rgba(255,255,255,0.08)',
                     boxShadow: team.status === 'LIVE' ? 'var(--shadow-glow)' : 'none',
-                    minWidth: '100px',
+                    minWidth: '120px',
+                    opacity: team.status === 'LIVE' ? 1 : 0.6,
                     cursor: team.status === 'LIVE' ? 'pointer' : 'not-allowed'
                 }}
             >

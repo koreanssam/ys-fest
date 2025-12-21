@@ -47,7 +47,12 @@ function UserApp() {
     <div className="container">
        <div className="logo-area">
           <div className="logo-text">영축한마당</div>
-          <div style={{color:'var(--text-secondary)', fontSize:'0.9rem', marginTop:'8px', letterSpacing:'0.2em'}}>2025 OFFICIAL</div>
+          <div className="title-row">
+            <div style={{color:'var(--text-secondary)', fontSize:'0.9rem', letterSpacing:'0.2em'}}>2025 OFFICIAL</div>
+            <div className={`badge-phase ${phase === 'BOOTHS' ? 'badge-phase--booths' : 'badge-phase--performance'}`}>
+              {phase === 'BOOTHS' ? '부스 진행중' : '공연 진행중'}
+            </div>
+          </div>
        </div>
 
        <div className="tabs">

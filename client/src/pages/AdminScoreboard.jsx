@@ -30,8 +30,8 @@ function AdminScoreboard() {
     <div className="container" style={{maxWidth: '1000px'}}>
       <div style={{marginBottom: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
            <h2 style={{margin:0, fontSize: '2rem'}}>🏆 최종 스코어보드</h2>
-           <button className="btn btn-secondary" onClick={() => window.location.href='/admin/dashboard'}>
-               ← 대시보드로 돌아가기
+           <button className="btn btn-secondary btn-compact" onClick={() => window.location.href='/admin/dashboard'}>
+               ← 대시보드
            </button>
       </div>
       

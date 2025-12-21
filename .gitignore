@@ -18,3 +18,9 @@ pnpm-debug.log*
 # Editor
 .vscode
 .idea
+
+# Local docs (do not push)
+memory-bank
+AGENTS.md
+fest_plan.md
+PRD.md
