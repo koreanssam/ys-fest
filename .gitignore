@@ -24,3 +24,6 @@ memory-bank
 AGENTS.md
 fest_plan.md
 PRD.md
+
+# Local SQLite DB (do not push)
+server/fest.db
