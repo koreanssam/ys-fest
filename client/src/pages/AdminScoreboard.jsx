@@ -1,13 +1,16 @@
 import React, { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Bar } from 'react-chartjs-2';
+import { apiFetch } from '../apiClient';
 
 function AdminScoreboard() {
   const [scores, setScores] = useState([]);
+  const navigate = useNavigate();
 
   useEffect(() => {
-    fetch('/api/scores').then(res => res.json()).then(setScores);
+    apiFetch('/api/scores').then(res => res.json()).then(setScores);
     const interval = setInterval(() => {
-        fetch('/api/scores').then(res => res.json()).then(setScores);
+        apiFetch('/api/scores').then(res => res.json()).then(setScores);
     }, 5000);
     return () => clearInterval(interval);
   }, []);
@@ -30,7 +33,7 @@ function AdminScoreboard() {
     <div className="container" style={{maxWidth: '1000px'}}>
       <div style={{marginBottom: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
            <h2 style={{margin:0, fontSize: '2rem'}}>🏆 최종 스코어보드</h2>
-           <button className="btn btn-secondary btn-compact" onClick={() => window.location.href='/admin/dashboard'}>
+           <button className="btn btn-secondary btn-compact" onClick={() => navigate('/admin/dashboard')}>
                ← 대시보드
            </button>
       </div>

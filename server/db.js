@@ -1,16 +1,93 @@
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 
-const dbPath = path.resolve(__dirname, 'fest.db');
-const db = new Database(dbPath); 
+const MAX_USAGE_PER_BOOTH = 3;
+const resolvedPath = process.env.DB_PATH ? path.resolve(process.env.DB_PATH) : path.resolve(__dirname, 'fest.db');
+fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+const db = new Database(resolvedPath);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+db.pragma('busy_timeout = 3000');
+
+const dataDir = path.join(__dirname, 'data');
+const studentCsvPath = path.join(dataDir, 'students.csv');
+const sourceSheetPath = path.resolve(__dirname, '..', 'student_sheet.csv');
+
+function ensureTeamColumns() {
+    const cols = db.prepare('PRAGMA table_info(teams)').all().map(c => c.name);
+    if (!cols.includes('judge_exempt')) {
+        db.prepare('ALTER TABLE teams ADD COLUMN judge_exempt INTEGER DEFAULT 0').run();
+    }
+    db.prepare('UPDATE teams SET judge_exempt = 0 WHERE judge_exempt IS NULL').run();
+}
+
+function ensureStudentCsv() {
+    fs.mkdirSync(dataDir, { recursive: true });
+    if (fs.existsSync(studentCsvPath)) return studentCsvPath;
+    if (!fs.existsSync(sourceSheetPath)) return studentCsvPath;
+
+    const raw = fs.readFileSync(sourceSheetPath, 'utf8').trim();
+    if (!raw) return studentCsvPath;
+
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    if (lines.length <= 1) return studentCsvPath;
+
+    const [, ...rows] = lines; // skip header
+    const normalized = ['grade,class_no,student_no,name'];
+    rows.forEach(line => {
+        const parts = line.split(',').map(p => p.trim());
+        if (parts.length < 4) return;
+        const [grade, classNo, studentNo, name] = parts;
+        if (!grade || !classNo || !studentNo || !name) return;
+        normalized.push([grade, classNo, studentNo, name].join(','));
+    });
+
+    fs.writeFileSync(studentCsvPath, normalized.join('\n'), 'utf8');
+    return studentCsvPath;
+}
+
+function parseStudentsCsv(filePath) {
+    if (!fs.existsSync(filePath)) return [];
+    const content = fs.readFileSync(filePath, 'utf8').trim();
+    if (!content) return [];
+    const lines = content.split(/\r?\n/);
+    const rows = [];
+    lines.slice(1).forEach(line => {
+        const [grade, class_no, student_no, name] = line.split(',').map(s => s.trim());
+        if (!grade || !class_no || !student_no || !name) return;
+        rows.push({
+            grade: parseInt(grade, 10),
+            class_no: parseInt(class_no, 10),
+            student_no: parseInt(student_no, 10),
+            name
+        });
+    });
+    return rows;
+}
+
+function dropTables() {
+    const tables = ['booth_usages_void', 'booth_usages', 'booth_admins', 'students', 'scores', 'judges', 'teams', 'booths'];
+    tables.forEach(tbl => {
+        db.prepare(`DROP TABLE IF EXISTS ${tbl}`).run();
+    });
+}
 
 function initDB() {
-    // Drop tables for fresh seed (Dev mode convenience)
-    db.prepare('DROP TABLE IF EXISTS teams').run();
-    db.prepare('DROP TABLE IF EXISTS judges').run();
-    db.prepare('DROP TABLE IF EXISTS scores').run();
-    db.prepare('DROP TABLE IF EXISTS booths').run();
+    if (process.env.SEED_MODE === 'fresh') {
+        console.log('[DB] fresh seed mode: dropping tables');
+        dropTables();
+    }
 
+    createCoreTables();
+    ensureTeamColumns();
+    createBoothOpsTables();
+    seedCoreData();
+    seedStudents();
+    seedBoothAdmins();
+}
+
+function createCoreTables() {
     // TEAMS (Performers)
     db.prepare(`
         CREATE TABLE IF NOT EXISTS teams (
@@ -21,7 +98,8 @@ function initDB() {
             category TEXT, -- 'GROUP' or 'INDIVIDUAL'
             vote_count INTEGER DEFAULT 0,
             status TEXT DEFAULT 'WAITING', -- WAITING, LIVE, DONE
-            perf_order INTEGER
+            perf_order INTEGER,
+            judge_exempt INTEGER DEFAULT 0 -- 1이면 심사에서 제외
         )
     `).run();
 
@@ -59,11 +137,63 @@ function initDB() {
             description TEXT
         )
     `).run();
-
-    seedData();
 }
 
-function seedData() {
+function createBoothOpsTables() {
+    db.prepare(`
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            grade INTEGER,
+            class_no INTEGER,
+            student_no INTEGER,
+            name TEXT
+        )
+    `).run();
+    db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_students_unique ON students (grade, class_no, student_no)').run();
+
+    db.prepare(`
+        CREATE TABLE IF NOT EXISTS booth_admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_name TEXT,
+            password TEXT
+        )
+    `).run();
+    db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_booth_admins_class ON booth_admins (class_name)').run();
+
+    db.prepare(`
+        CREATE TABLE IF NOT EXISTS booth_usages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booth_id INTEGER,
+            student_id INTEGER,
+            used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            admin_id INTEGER,
+            FOREIGN KEY (booth_id) REFERENCES booths(id),
+            FOREIGN KEY (student_id) REFERENCES students(id),
+            FOREIGN KEY (admin_id) REFERENCES booth_admins(id)
+        )
+    `).run();
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_booth_usages_student_booth ON booth_usages (student_id, booth_id)').run();
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_booth_usages_used_at ON booth_usages (used_at DESC)').run();
+
+    const voidFks = db.prepare("PRAGMA foreign_key_list('booth_usages_void')").all();
+    const hasUsageFk = voidFks.some(row => row.table === 'booth_usages');
+    if (voidFks.length && hasUsageFk) {
+        db.prepare('DROP TABLE IF EXISTS booth_usages_void').run();
+    }
+
+    db.prepare(`
+        CREATE TABLE IF NOT EXISTS booth_usages_void (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booth_usage_id INTEGER,
+            void_by_admin_id INTEGER,
+            void_reason TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (void_by_admin_id) REFERENCES booth_admins(id)
+        )
+    `).run();
+}
+
+function seedCoreData() {
     // Seed If Empty
     const teamCount = db.prepare('SELECT count(*) as c FROM teams').get().c;
     if (teamCount === 0) {
@@ -121,12 +251,55 @@ function seedData() {
     }
 }
 
+function seedStudents() {
+    const studentCount = db.prepare('SELECT count(*) as c FROM students').get().c;
+    if (studentCount > 0) return;
+
+    const csvPath = ensureStudentCsv();
+    const students = parseStudentsCsv(csvPath);
+    if (students.length === 0) {
+        console.warn('[DB] No students parsed for seeding');
+        return;
+    }
+
+    const insert = db.prepare('INSERT INTO students (grade, class_no, student_no, name) VALUES (?, ?, ?, ?)');
+    const tx = db.transaction((rows) => {
+        rows.forEach(r => insert.run(r.grade, r.class_no, r.student_no, r.name));
+    });
+    tx(students);
+    console.log(`[DB] Seeded ${students.length} students`);
+}
+
+function seedBoothAdmins() {
+    const adminCount = db.prepare('SELECT count(*) as c FROM booth_admins').get().c;
+    if (adminCount > 0) return;
+    const booths = getBooths();
+    if (!booths.length) return;
+
+    const insert = db.prepare('INSERT INTO booth_admins (class_name, password) VALUES (?, ?)');
+    const tx = db.transaction((rows) => {
+        rows.forEach(row => insert.run(row.class_name, row.password));
+    });
+
+    // Default password is deliberately simple for on-site ops; change in DB if needed.
+    tx(booths.map(b => ({ class_name: b.class_name, password: '0000' })));
+    console.log(`[DB] Seeded ${booths.length} booth admins with default PINs`);
+}
+
 function getTeams() {
     return db.prepare('SELECT * FROM teams ORDER BY perf_order ASC').all();
 }
 
 function getBooths() {
     return db.prepare('SELECT * FROM booths').all();
+}
+
+function getBoothById(id) {
+    return db.prepare('SELECT * FROM booths WHERE id = ?').get(id);
+}
+
+function getBoothByClassName(className) {
+    return db.prepare('SELECT * FROM booths WHERE class_name = ?').get(className);
 }
 
 function getJudges() {
@@ -160,6 +333,20 @@ function getScores() {
     `).all();
 }
 
+function getScoresByJudge(judgeId) {
+    return db.prepare(`
+        SELECT 
+            team_id, 
+            score_prep, 
+            score_resp, 
+            score_exp, 
+            score_inc, 
+            total 
+        FROM scores 
+        WHERE judge_id = ?
+    `).all(judgeId);
+}
+
 function updateVoteCount(id, increment) {
     db.prepare('UPDATE teams SET vote_count = vote_count + ? WHERE id = ?').run(increment, id);
 }
@@ -169,13 +356,16 @@ function updateTeamStatus(id, status) {
 }
 
 function addTeam(name, description, imageUrl, category = 'GROUP') {
-    // Get max order
     const maxOrder = db.prepare('SELECT MAX(perf_order) as m FROM teams').get().m || 0;
     return db.prepare("INSERT INTO teams (name, description, image_url, category, status, perf_order) VALUES (?, ?, ?, ?, 'WAITING', ?)").run(name, description, imageUrl, category, maxOrder + 1);
 }
 
 function updateTeam(id, name, description) {
     db.prepare('UPDATE teams SET name = ?, description = ? WHERE id = ?').run(name, description, id);
+}
+
+function setTeamJudgeExempt(id, exempt) {
+    db.prepare('UPDATE teams SET judge_exempt = ? WHERE id = ?').run(exempt ? 1 : 0, id);
 }
 
 function updateBooth(id, data) {
@@ -185,7 +375,6 @@ function updateBooth(id, data) {
 }
 
 function updateTeamOrder(orders) {
-    // orders = [{id: 1, order: 1}, {id: 2, order: 2}]
     const update = db.prepare('UPDATE teams SET perf_order = ? WHERE id = ?');
     const transaction = db.transaction((items) => {
         for (const item of items) update.run(item.order, item.id);
@@ -197,19 +386,167 @@ function deleteTeam(id) {
     db.prepare('DELETE FROM teams WHERE id = ?').run(id);
 }
 
+function resetStats() {
+    db.prepare('DELETE FROM scores').run();
+    db.prepare('UPDATE teams SET vote_count = 0').run();
+}
+
+// --- Booth ops helpers ---
+function getStudents(filters = {}) {
+    const { search, grade, class_no } = filters;
+    let query = 'SELECT id, grade, class_no, student_no, name FROM students WHERE 1=1';
+    const params = [];
+    if (grade) {
+        query += ' AND grade = ?';
+        params.push(parseInt(grade, 10));
+    }
+    if (class_no) {
+        query += ' AND class_no = ?';
+        params.push(parseInt(class_no, 10));
+    }
+    if (search) {
+        query += ' AND (name LIKE ? OR CAST(student_no AS TEXT) LIKE ?)';
+        const term = `%${search}%`;
+        params.push(term, term);
+    }
+    query += ' ORDER BY grade ASC, class_no ASC, student_no ASC';
+    return db.prepare(query).all(...params);
+}
+
+function getStudentById(id) {
+    return db.prepare('SELECT * FROM students WHERE id = ?').get(id);
+}
+
+function loginBoothAdmin(className, password) {
+    return db.prepare('SELECT * FROM booth_admins WHERE class_name = ? AND password = ?').get(className, password);
+}
+
+function getBoothUsageById(id) {
+    return db.prepare('SELECT * FROM booth_usages WHERE id = ?').get(id);
+}
+
+function useBooth(boothId, studentId, adminId) {
+    const countStmt = db.prepare('SELECT COUNT(*) as c FROM booth_usages WHERE booth_id = ? AND student_id = ?');
+    const insertStmt = db.prepare('INSERT INTO booth_usages (booth_id, student_id, admin_id) VALUES (?, ?, ?)');
+    const recentStmt = db.prepare(`
+        SELECT u.id, u.booth_id, u.student_id, u.admin_id, u.used_at,
+               s.name as student_name, s.grade, s.class_no, s.student_no,
+               ba.class_name as admin_class
+        FROM booth_usages u
+        JOIN students s ON u.student_id = s.id
+        LEFT JOIN booth_admins ba ON u.admin_id = ba.id
+        WHERE u.id = ?
+    `);
+
+    const tx = db.transaction((bId, sId, aId) => {
+        const current = countStmt.get(bId, sId).c;
+        if (current >= MAX_USAGE_PER_BOOTH) {
+            return { success: false, error: 'OVER_LIMIT', totalUsed: current, remaining: 0 };
+        }
+        const result = insertStmt.run(bId, sId, aId);
+        const totalUsed = current + 1;
+        const recentEntry = recentStmt.get(result.lastInsertRowid);
+        return { success: true, totalUsed, remaining: Math.max(0, MAX_USAGE_PER_BOOTH - totalUsed), recentEntry };
+    });
+
+    if (typeof tx.immediate === 'function') {
+        return tx.immediate(boothId, studentId, adminId);
+    }
+    return tx(boothId, studentId, adminId);
+}
+
+function voidBoothUsage(usageId, adminId, reason) {
+    const insertVoid = db.prepare('INSERT INTO booth_usages_void (booth_usage_id, void_by_admin_id, void_reason) VALUES (?, ?, ?)');
+    const deleteUsage = db.prepare('DELETE FROM booth_usages WHERE id = ?');
+    const tx = db.transaction((id, admin, why) => {
+        insertVoid.run(id, admin, why || '');
+        deleteUsage.run(id);
+        return { success: true };
+    });
+
+    if (typeof tx.immediate === 'function') {
+        return tx.immediate(usageId, adminId, reason);
+    }
+    return tx(usageId, adminId, reason);
+}
+
+function getBoothUsageSummary(boothId) {
+    const totalUsage = db.prepare('SELECT COUNT(*) as c FROM booth_usages WHERE booth_id = ?').get(boothId).c;
+    const uniqueStudents = db.prepare('SELECT COUNT(DISTINCT student_id) as c FROM booth_usages WHERE booth_id = ?').get(boothId).c;
+
+    const topClasses = db.prepare(`
+        SELECT s.grade, s.class_no, COUNT(*) as count
+        FROM booth_usages u
+        JOIN students s ON u.student_id = s.id
+        WHERE u.booth_id = ?
+        GROUP BY s.grade, s.class_no
+        ORDER BY count DESC
+        LIMIT 3
+    `).all(boothId).map(row => ({ class_name: `${row.grade}-${row.class_no}`, count: row.count }));
+
+    const perStudentCounts = {};
+    db.prepare('SELECT student_id, COUNT(*) as count FROM booth_usages WHERE booth_id = ? GROUP BY student_id')
+      .all(boothId)
+      .forEach(row => { perStudentCounts[row.student_id] = row.count; });
+
+    const recent = db.prepare(`
+        SELECT u.id, u.booth_id, u.student_id, u.admin_id, u.used_at,
+               s.name as student_name, s.grade, s.class_no, s.student_no,
+               ba.class_name as admin_class
+        FROM booth_usages u
+        JOIN students s ON u.student_id = s.id
+        LEFT JOIN booth_admins ba ON u.admin_id = ba.id
+        WHERE u.booth_id = ?
+        ORDER BY u.used_at DESC, u.id DESC
+        LIMIT 20
+    `).all(boothId);
+
+    const totalStudents = db.prepare('SELECT COUNT(*) as c FROM students').get().c;
+    const remainingBuckets = { 3: 0, 2: 0, 1: 0, 0: 0 };
+    db.prepare('SELECT id FROM students').all().forEach(row => {
+        const used = perStudentCounts[row.id] || 0;
+        const rem = MAX_USAGE_PER_BOOTH - used;
+        const bucket = rem <= 0 ? 0 : rem;
+        remainingBuckets[bucket] = (remainingBuckets[bucket] || 0) + 1;
+    });
+
+    return {
+        totalUsage,
+        uniqueStudents,
+        topClasses,
+        recent,
+        perStudentCounts,
+        remainingBuckets,
+        totalStudents
+    };
+}
+
 module.exports = {
     initDB,
     getTeams,
     getBooths,
+    getBoothById,
+    getBoothByClassName,
     getJudges,
     loginJudge,
     submitScore,
     getScores,
+    getScoresByJudge,
     updateVoteCount,
     updateTeamStatus,
     addTeam,
     updateTeam,
+    setTeamJudgeExempt,
     updateBooth,
     updateTeamOrder,
-    deleteTeam
+    deleteTeam,
+    resetStats,
+    // booth ops
+    getStudents,
+    getStudentById,
+    loginBoothAdmin,
+    useBooth,
+    voidBoothUsage,
+    getBoothUsageSummary,
+    getBoothUsageById
 };

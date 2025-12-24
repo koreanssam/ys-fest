@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test server/__tests__",
     "start": "node server/server.js",
     "server": "nodemon server/server.js",
     "client": "cd client && npm run dev",
@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
-    "nodemon": "^3.1.11"
+    "nodemon": "^3.1.11",
+    "supertest": "^7.1.4"
   }
 }

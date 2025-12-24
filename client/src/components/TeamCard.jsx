@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { apiFetch } from '../apiClient';
 
 // Batching logic could be global, but for simplicity we can trigger headers here or use a context.
 // Actually, detailed plan says "Client collects votes and sends every 1s".
@@ -22,7 +23,7 @@ if (!window.voteInterval) {
     Object.keys(queue).forEach(teamId => {
       const count = queue[teamId];
       if (count > 0) {
-        fetch('/api/vote', {
+        apiFetch('/api/vote', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ teamId: parseInt(teamId), count })
@@ -44,6 +45,7 @@ function TeamCard({ team, isLive }) {
   const burstCountRef = useRef(0);
   const cardRef = useRef(null);
   const buttonRef = useRef(null);
+  const buttonLabel = team.status === 'LIVE' ? '♥ 좋아요' : team.status === 'DONE' ? '완료' : '대기중';
 
   useEffect(() => {
     setVotes(team.vote_count);
@@ -155,7 +157,7 @@ function TeamCard({ team, isLive }) {
                     cursor: team.status === 'LIVE' ? 'pointer' : 'not-allowed'
                 }}
             >
-                {team.status === 'LIVE' ? '♥ 좋아요' : '대기중'}
+                {buttonLabel}
             </button>
         </div>
     </div>

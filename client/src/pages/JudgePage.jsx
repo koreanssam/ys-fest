@@ -2,11 +2,14 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import StarSlider from '../components/StarSlider';
+import { apiFetch } from '../apiClient';
 
 function JudgePage() {
   const [teams, setTeams] = useState([]);
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [scores, setScores] = useState({ prep: 0, resp: 0, exp: 0, inc: 0 });
+  const [judgedTeamIds, setJudgedTeamIds] = useState([]);
+  const [judgeScores, setJudgeScores] = useState({});
   const navigate = useNavigate();
   const judge = JSON.parse(localStorage.getItem('judge_token') || 'null');
 
@@ -23,6 +26,9 @@ function JudgePage() {
       const jName = judgeName.trim();
       const cat = (t.category || '').toUpperCase();
 
+      if (t.judge_exempt) {
+          return false;
+      }
       // Permission Rule: Moon Unju cannot see INDIVIDUAL
       if (jName.includes('문운주') && cat === 'INDIVIDUAL') {
           console.log(`Skipping team ${t.name} (Category: ${cat}) for judge ${jName}`);
@@ -36,9 +42,49 @@ function JudgePage() {
   const doneTeams = filteredTeams.filter(t => t.status === 'DONE');
 
   useEffect(() => {
-    if (!judge) navigate('/judge/login');
-    fetch('/api/teams').then(res => res.json()).then(setTeams);
-  }, []);
+    if (!judge) {
+      navigate('/judge/login');
+      return;
+    }
+    apiFetch('/api/teams')
+      .then(res => res.json())
+      .then(setTeams);
+
+    apiFetch(`/api/judge/${judge.id}/scores`)
+      .then(res => res.json())
+      .then(data => {
+        const scoreRows = Array.isArray(data.scores) ? data.scores : [];
+        const idsFromScores = scoreRows
+          .map(row => parseInt(row.team_id, 10))
+          .filter(id => !Number.isNaN(id));
+
+        const idsFromTeamIds = Array.isArray(data.teamIds)
+          ? data.teamIds.map(n => parseInt(n, 10)).filter(id => !Number.isNaN(id))
+          : [];
+
+        const scoresByTeam = {};
+        scoreRows.forEach(row => {
+          if (row && row.team_id !== undefined) {
+            const teamId = parseInt(row.team_id, 10);
+            if (!Number.isNaN(teamId)) {
+              scoresByTeam[teamId] = row.total;
+            }
+          }
+        });
+
+        // Backward compatibility: if API only returns teamIds, mark as judged without totals
+        if (Object.keys(scoresByTeam).length === 0) {
+          idsFromTeamIds.forEach(id => {
+            scoresByTeam[id] = scoresByTeam[id] ?? null;
+          });
+        }
+
+        const finalIds = idsFromScores.length > 0 ? idsFromScores : idsFromTeamIds;
+        setJudgeScores(scoresByTeam);
+        setJudgedTeamIds(finalIds);
+      })
+      .catch(() => {});
+  }, [judge?.id]);
 
   const handleScoreChange = (field, val) => {
     setScores(prev => ({ ...prev, [field]: parseInt(val) || 0 }));
@@ -62,7 +108,7 @@ function JudgePage() {
         return;
     }
 
-    await fetch('/api/judge/score', {
+    await apiFetch('/api/judge/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -73,6 +119,8 @@ function JudgePage() {
     });
 
     alert(`${selectedTeam.name} 팀 채점 완료!`);
+    setJudgedTeamIds(prev => prev.includes(selectedTeam.id) ? prev : [...prev, selectedTeam.id]);
+    setJudgeScores(prev => ({ ...prev, [selectedTeam.id]: total }));
     setSelectedTeam(null);
     setScores({ prep: 0, resp: 0, exp: 0, inc: 0 });
   };
@@ -91,14 +139,34 @@ function JudgePage() {
           <div className="fade-in">
               <p>채점할 팀을 선택하세요:</p>
               {filteredTeams.map(team => (
-                  <div key={team.id} className="card" onClick={() => setSelectedTeam(team)} 
-                       style={{ 
-                           cursor: 'pointer', 
-                           border: team.status === 'LIVE' ? '2px solid var(--accent-color)' : '1px solid var(--glass-border)'
-                       }}>
-                      <div style={{display:'flex', justifyContent:'space-between'}}>
+                  <div 
+                      key={team.id} 
+                      className="card" 
+                      onClick={() => setSelectedTeam(team)} 
+                      style={{ 
+                          cursor: 'pointer', 
+                          border: team.status === 'LIVE' ? '2px solid var(--accent-color)' : '1px solid var(--glass-border)',
+                          background: judgedTeamIds.includes(team.id) ? 'rgba(60, 210, 165, 0.14)' : undefined,
+                          boxShadow: judgedTeamIds.includes(team.id) ? '0 0 0 1px rgba(60, 210, 165, 0.25), var(--shadow-card)' : undefined
+                      }}>
+                      <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', gap:'8px'}}>
                           <b>{team.name}</b>
-                          {team.status === 'LIVE' && <span style={{color:'red'}}>● 진행중</span>}
+                          <div style={{display:'flex', alignItems:'center', gap:'8px'}}>
+                              {team.status === 'LIVE' && <span style={{color:'red'}}>● 진행중</span>}
+                              {judgedTeamIds.includes(team.id) && (
+                                  <span style={{
+                                      background: 'rgba(60, 210, 165, 0.2)',
+                                      color: 'var(--success-color)',
+                                      border: '1px solid rgba(60, 210, 165, 0.3)',
+                                      borderRadius: '999px',
+                                      padding: '2px 10px',
+                                      fontSize: '0.8rem',
+                                      fontWeight: 700
+                                  }}>
+                                      심사완료{judgeScores[team.id] !== undefined && judgeScores[team.id] !== null ? ` · ${judgeScores[team.id]}점` : ''}
+                                  </span>
+                              )}
+                          </div>
                       </div>
                       <div style={{fontSize:'0.8rem', color:'#888'}}>{team.description}</div>
                   </div>

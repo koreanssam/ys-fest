@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import TeamCard from './TeamCard';
+import { apiEventSource, apiFetch } from '../apiClient';
 
 function TimetableTab() {
   const [teams, setTeams] = useState([]);
@@ -10,7 +11,7 @@ function TimetableTab() {
     fetchTeams();
 
     // SSE for near-instant updates when admin changes status/order
-    const es = new EventSource('/api/stream/dashboard');
+    const es = apiEventSource('/api/stream/dashboard');
     es.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
@@ -37,7 +38,7 @@ function TimetableTab() {
   }, []);
 
   const fetchTeams = () => {
-    fetch('/api/teams')
+    apiFetch('/api/teams')
       .then(res => res.json())
       .then(data => {
         setTeams(data);

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { apiFetch } from '../apiClient';
 
 function JudgeLogin() {
   const [name, setName] = useState('');
@@ -9,7 +10,7 @@ function JudgeLogin() {
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
-        const res = await fetch('/api/judge/login', {
+        const res = await apiFetch('/api/judge/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, password })

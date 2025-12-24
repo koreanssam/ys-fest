@@ -10,6 +10,7 @@ import {
 } from 'chart.js';
 import { Bar } from 'react-chartjs-2';
 import { useNavigate } from 'react-router-dom';
+import { apiEventSource, apiFetch } from '../apiClient';
 
 ChartJS.register(
   CategoryScale,
@@ -37,11 +38,11 @@ function AdminDashboard() {
     }
 
     // Initial fetch
-    fetch('/api/teams').then(res => res.json()).then(setTeams);
-    fetch('/api/phase').then(res => res.json()).then(d => setPhase(d.phase));
+    apiFetch('/api/teams').then(res => res.json()).then(setTeams);
+    apiFetch('/api/phase').then(res => res.json()).then(d => setPhase(d.phase));
 
     // SSE Connection
-    const eventSource = new EventSource('/api/stream/dashboard');
+    const eventSource = apiEventSource('/api/stream/dashboard');
 
     eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -66,24 +67,44 @@ function AdminDashboard() {
   };
 
   const saveEdit = async (id) => {
-      await fetch(`/api/admin/team/${id}`, {
+      await apiFetch(`/api/admin/team/${id}`, {
           method: 'PUT',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ name: editName, description: editDesc })
       });
+      setTeams(prev => prev.map(t => t.id === id ? { ...t, name: editName, description: editDesc } : t));
       setEditingId(null);
+  };
+
+  const cancelEdit = () => {
+      setEditingId(null);
+      setEditName('');
+      setEditDesc('');
+  };
+
+  const toggleJudgeExempt = async (teamId, exempt) => {
+    // Optimistic update
+    setTeams(prev => prev.map(t => t.id === teamId ? { ...t, judge_exempt: exempt } : t));
+    await apiFetch(`/api/admin/team/${teamId}/judge-exempt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exempt })
+    }).catch(() => {
+      // Refresh on failure
+      apiFetch('/api/teams').then(res => res.json()).then(setTeams);
+    });
   };
 
   const updateStatus = (teamId, status) => {
     // Optimistic UI update to avoid waiting for SSE roundtrip
     setTeams(prev => prev.map(t => t.id === teamId ? { ...t, status } : t));
-    fetch('/api/admin/status', {
+    apiFetch('/api/admin/status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ teamId, status })
     }).catch(() => {
         // Fallback: refetch if request fails
-        fetch('/api/teams').then(res => res.json()).then(setTeams);
+        apiFetch('/api/teams').then(res => res.json()).then(setTeams);
     });
   };
 
@@ -109,7 +130,7 @@ function AdminDashboard() {
 
     // Sync to Server
     const orders = newTeams.map((t, i) => ({ id: t.id, order: i + 1 }));
-    await fetch('/api/admin/team/reorder', {
+    await apiFetch('/api/admin/team/reorder', {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ orders })
@@ -121,7 +142,7 @@ function AdminDashboard() {
   const togglePhase = (e) => {
       const newP = e.target.checked ? 'PERFORMANCE' : 'BOOTHS';
       setPhase(newP); // Optimistic
-      fetch('/api/admin/phase', { 
+      apiFetch('/api/admin/phase', { 
            method: 'POST', 
            headers: {'Content-Type': 'application/json'},
            body: JSON.stringify({ phase: newP })
@@ -169,7 +190,7 @@ function AdminDashboard() {
       <div className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
-                <h3 style={{margin:0}}>진행 단계 ({phase === 'BOOTHS' ? '부스 운영' : '공연'})</h3>
+               <h3 style={{margin:0}}>진행 단계 ({phase === 'BOOTHS' ? '부스 운영' : '공연'})</h3>
                 <p style={{color:'#888', margin:0}}>{phase === 'BOOTHS' ? '현재 부스 탭만 보입니다.' : '현재 공연 탭만 보입니다.'}</p>
               </div>
               
@@ -182,13 +203,20 @@ function AdminDashboard() {
           <div style={{ marginTop: '20px', display:'flex', gap:'10px', alignItems:'center', flexWrap:'wrap' }}>
                <button className="btn btn-compact" onClick={() => navigate('/admin/scoreboard')}>🏆 스코어보드 열기</button>
                <button className="btn btn-secondary btn-compact" onClick={() => navigate('/admin/booths')}>🏫 부스 관리</button>
+               <button className="btn btn-secondary btn-compact" onClick={() => navigate('/booth-ops')}>📋 부스 운영</button>
+               <button className="btn btn-secondary btn-compact" style={{background:'#442'}} onClick={async () => {
+                   if (!window.confirm('전체 투표/점수를 초기화할까요? 되돌릴 수 없습니다.')) return;
+                   await apiFetch('/api/admin/reset-stats', { method: 'POST' });
+                   apiFetch('/api/teams').then(res => res.json()).then(setTeams);
+                   alert('전체 통계가 초기화되었습니다.');
+               }}>🗑️ 통계 초기화</button>
                
                <div style={{marginLeft: 'auto', display:'flex', alignItems:'center', gap:'8px', background: 'rgba(255,255,255,0.05)', padding: '5px 10px', borderRadius:'8px'}}>
                     <span style={{fontSize:'0.8rem'}}>🧹 청소 알림 시간 설정:</span>
                     <input type="datetime-local" style={{padding:'4px', fontSize:'0.8rem', width:'180px'}} onChange={(e) => {
                         const val = e.target.value; // "YYYY-MM-DDTHH:mm"
                         if(val) {
-                            fetch('/api/admin/cleanup', {
+                            apiFetch('/api/admin/cleanup', {
                                 method: 'POST',
                                 headers: {'Content-Type':'application/json'},
                                 body: JSON.stringify({ target: val })
@@ -205,13 +233,16 @@ function AdminDashboard() {
             <thead>
                 <tr style={{ textAlign: 'left', borderBottom: '1px solid #444' }}>
                     <th style={{padding: '10px'}}>순서</th>
-                    <th style={{padding: '10px'}}>팀명</th>
+                    <th style={{padding: '10px'}}>팀 / 무대 정보</th>
                     <th style={{padding: '10px'}}>현재 상태</th>
+                    <th style={{padding: '10px'}}>심사제외</th>
                     <th style={{padding: '10px'}}>관리</th>
                 </tr>
             </thead>
             <tbody>
-                {teams.map((team, idx) => (
+                {teams.map((team, idx) => {
+                    const isEditing = editingId === team.id;
+                    return (
                     <tr 
                         key={team.id} 
                         draggable 
@@ -224,17 +255,17 @@ function AdminDashboard() {
                             <span style={{fontSize:'1.2rem'}}>☰</span> {idx + 1}
                         </td>
                         <td style={{padding: '10px'}}>
-                            {editingId === team.id ? (
-                                <div>
+                            {isEditing ? (
+                                <div style={{display:'flex', flexDirection:'column', gap:'6px'}}>
+                                    <label style={{fontSize:'0.8rem', color:'#aaa'}}>팀명</label>
                                     <input value={editName} onChange={e => setEditName(e.target.value)} style={{marginBottom:'4px'}} />
-                                    <input value={editDesc} onChange={e => setEditDesc(e.target.value)} />
-                                    <button className="btn" style={{padding: '4px 8px', fontSize: '0.7rem', marginTop:'4px'}} onClick={() => saveEdit(team.id)}>저장</button>
-                                    <button className="btn btn-secondary" style={{padding: '4px 8px', fontSize: '0.7rem', marginTop:'4px'}} onClick={() => setEditingId(null)}>취소</button>
+                                    <label style={{fontSize:'0.8rem', color:'#aaa'}}>무대 / 설명</label>
+                                    <textarea value={editDesc} rows="2" onChange={e => setEditDesc(e.target.value)} />
                                 </div>
                             ) : (
                                 <div onClick={() => startEdit(team)} style={{cursor:'pointer', borderBottom:'1px dashed #666', display:'inline-block'}}>
                                     {team.name}
-                                    <div style={{fontSize: '0.8rem', color: '#888'}}>{team.description}</div>
+                                    <div style={{fontSize: '0.8rem', color: '#888'}}>{team.description || '무대 설명이 없습니다.'}</div>
                                 </div>
                             )}
                         </td>
@@ -247,20 +278,42 @@ function AdminDashboard() {
                             </span>
                         </td>
                         <td style={{padding: '10px'}}>
-                            <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', marginRight:'8px', background: '#222', border: '1px solid #444' }} onClick={() => updateStatus(team.id, 'HIDDEN')}>숨김</button>
-                            <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', marginRight:'8px' }} onClick={() => updateStatus(team.id, 'WAITING')}>대기</button>
-                            <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', marginRight:'8px', background: 'red' }} onClick={() => updateStatus(team.id, 'LIVE')}>라이브</button>
-                            <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', marginRight:'8px', background: '#555' }} onClick={() => updateStatus(team.id, 'DONE')}>완료</button>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                                <input 
+                                  type="checkbox" 
+                                  checked={!!team.judge_exempt} 
+                                  onChange={(e) => toggleJudgeExempt(team.id, e.target.checked)} 
+                                />
+                                <span style={{fontSize:'0.85rem'}}>심사 제외</span>
+                            </label>
+                        </td>
+                        <td style={{padding: '10px', minWidth:'280px'}}>
+                            <div style={{display:'flex', gap:'6px', flexWrap:'wrap', marginBottom:'8px'}}>
+                                {isEditing ? (
+                                    <>
+                                        <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem' }} onClick={() => saveEdit(team.id)}>저장</button>
+                                        <button className="btn btn-secondary" style={{ padding: '6px 12px', fontSize: '0.8rem' }} onClick={cancelEdit}>취소</button>
+                                    </>
+                                ) : (
+                                    <button className="btn btn-secondary" style={{ padding: '6px 12px', fontSize: '0.8rem' }} onClick={() => startEdit(team)}>✏️ 수정</button>
+                                )}
+                            </div>
+                            <div style={{display:'flex', gap:'6px', flexWrap:'wrap', marginBottom:'8px'}}>
+                                <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', background: '#222', border: '1px solid #444' }} onClick={() => updateStatus(team.id, 'HIDDEN')}>숨김</button>
+                                <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem' }} onClick={() => updateStatus(team.id, 'WAITING')}>대기</button>
+                                <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', background: 'red' }} onClick={() => updateStatus(team.id, 'LIVE')}>라이브</button>
+                                <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', background: '#555' }} onClick={() => updateStatus(team.id, 'DONE')}>완료</button>
+                            </div>
                             <button className="btn" style={{ padding: '6px 12px', fontSize: '0.8rem', background: '#333', border: '1px solid #555' }} onClick={async () => {
                                 if(confirm('정말 이 팀을 삭제하시겠습니까? (되돌릴 수 없습니다!)')) {
-                                    await fetch(`/api/admin/team/${team.id}`, { method: 'DELETE' });
+                                    await apiFetch(`/api/admin/team/${team.id}`, { method: 'DELETE' });
                                     // SSE handles update, but optimistic update is good too
                                     setTeams(prev => prev.filter(t => t.id !== team.id));
                                 }
                             }}>🗑️ 삭제</button>
                         </td>
                     </tr>
-                ))}
+                );})}
             </tbody>
         </table>
         
@@ -282,7 +335,7 @@ function AdminDashboard() {
                     return;
                 }
 
-                fetch('/api/admin/team', {
+                apiFetch('/api/admin/team', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ name, description, category })
@@ -294,7 +347,7 @@ function AdminDashboard() {
                         document.getElementById('newTeamName').value = '';
                         document.getElementById('newTeamDesc').value = '';
                         // Refresh logic if SSE is slow
-                        fetch('/api/teams').then(res => res.json()).then(setTeams);
+                        apiFetch('/api/teams').then(res => res.json()).then(setTeams);
                     } else {
                         alert('추가 실패: ' + (data.error || 'Unknown error'));
                     }

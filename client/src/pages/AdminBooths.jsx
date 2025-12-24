@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { apiFetch } from '../apiClient';
 
 function AdminBooths() {
   const [booths, setBooths] = useState([]);
@@ -8,7 +9,7 @@ function AdminBooths() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    fetch('/api/booths').then(r => r.json()).then(setBooths);
+    apiFetch('/api/booths').then(r => r.json()).then(setBooths);
   }, []);
 
   const handleChange = (id, field, val) => {
@@ -30,14 +31,14 @@ function AdminBooths() {
       const data = forms[id];
       // We need an endpoint PUT /api/admin/booth/:id
       // Assuming we'll implement it shortly in server.js
-      await fetch(`/api/admin/booth/${id}`, {
+      await apiFetch(`/api/admin/booth/${id}`, {
           method: 'PUT',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(data)
       });
       setEditingId(null);
       // Refresh
-      fetch('/api/booths').then(r => r.json()).then(setBooths);
+      apiFetch('/api/booths').then(r => r.json()).then(setBooths);
   };
 
   return (

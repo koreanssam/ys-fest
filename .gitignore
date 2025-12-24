@@ -27,3 +27,6 @@ PRD.md
 
 # Local SQLite DB (do not push)
 server/fest.db
+server/fest.db-wal
+server/fest.db-shm
+server/__tests__/tmp

@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { apiFetch } from '../apiClient';
 
 function BoothList() {
   const [booths, setBooths] = useState([]);
@@ -9,7 +10,7 @@ function BoothList() {
   const cleanupTarget = useRef(null); 
 
   useEffect(() => {
-    fetch('/api/booths')
+    apiFetch('/api/booths')
       .then(res => res.json())
       .then(data => setBooths(data));
 
@@ -24,7 +25,7 @@ function BoothList() {
     };
 
     const fetchCleanup = () => {
-        fetch('/api/cleanup', { cache: 'no-store' })
+        apiFetch('/api/cleanup', { cache: 'no-store' })
           .then(r => r.json())
           .then(d => {
               const parsed = parseTarget(d.target);

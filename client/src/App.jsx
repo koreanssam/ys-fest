@@ -9,6 +9,8 @@ import AdminScoreboard from './pages/AdminScoreboard';
 import AdminBooths from './pages/AdminBooths';
 import JudgeLogin from './pages/JudgeLogin';
 import JudgePage from './pages/JudgePage';
+import BoothOps from './pages/BoothOps';
+import { apiFetch } from './apiClient';
 
 function UserApp() {
   const [activeTab, setActiveTab] = useState('info');
@@ -17,7 +19,7 @@ function UserApp() {
   useEffect(() => {
     // Poll system phase every 3 seconds to auto-switch tabs for users
     const pollPhase = () => {
-        fetch('/api/phase')
+        apiFetch('/api/phase')
             .then(res => res.json())
             .then(data => {
                 setPhase(data.phase);
@@ -82,8 +84,10 @@ function UserApp() {
 }
 
 function App() {
+  const basename = import.meta.env.BASE_URL || '/';
+
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={basename}>
       <Routes>
         <Route path="/" element={<UserApp />} />
         
@@ -98,6 +102,9 @@ function App() {
         <Route path="/judge" element={<Navigate to="/judge/login" />} />
         <Route path="/judge/login" element={<JudgeLogin />} />
         <Route path="/judge/vote" element={<JudgePage />} />
+
+        {/* Booth Ops */}
+        <Route path="/booth-ops" element={<BoothOps />} />
       </Routes>
     </BrowserRouter>
   );

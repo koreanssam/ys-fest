@@ -1,13 +1,15 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
+const ADMIN_PASSWORD = 'dudtkswnd1!'; // Hardcoded as per PRD
+
 function AdminLogin() {
   const [password, setPassword] = useState('');
   const navigate = useNavigate();
 
   const handleLogin = (e) => {
     e.preventDefault();
-    if (password === 'admin1234') { // Hardcoded as per PRD
+    if (password === ADMIN_PASSWORD) {
       localStorage.setItem('admin_token', 'true');
       navigate('/admin/dashboard');
     } else {
