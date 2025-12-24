@@ -28,6 +28,13 @@ function AdminDashboard() {
   const [editName, setEditName] = useState('');
   const [editDesc, setEditDesc] = useState('');
   const [phase, setPhase] = useState('BOOTHS'); // Global Phase state
+  const [uploadingTeamId, setUploadingTeamId] = useState(null);
+  const [studentCount, setStudentCount] = useState(null);
+  const [studentCsvFile, setStudentCsvFile] = useState(null);
+  const [studentImportMode, setStudentImportMode] = useState('replace');
+  const [studentResetUsage, setStudentResetUsage] = useState(false);
+  const [studentImporting, setStudentImporting] = useState(false);
+  const [studentImportResult, setStudentImportResult] = useState(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -40,23 +47,37 @@ function AdminDashboard() {
     // Initial fetch
     apiFetch('/api/teams').then(res => res.json()).then(setTeams);
     apiFetch('/api/phase').then(res => res.json()).then(d => setPhase(d.phase));
+    apiFetch('/api/admin/students/stats').then(res => res.json()).then(d => setStudentCount(d.totalStudents)).catch(() => {});
 
     // SSE Connection
-    const eventSource = apiEventSource('/api/stream/dashboard');
-
-    eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.teams) setTeams(data.teams); // Handle update
-      else setTeams(data); // Handle initial or direct array
-      setIsConnected(true);
-    };
-    
-    eventSource.onerror = (err) => {
-      eventSource.close();
-    };
+    let eventSource;
+    let cancelled = false;
+    (async () => {
+      try {
+        eventSource = await apiEventSource('/api/stream/dashboard');
+      } catch (err) {
+        console.error('SSE connect error', err);
+        return;
+      }
+      if (cancelled) {
+        eventSource.close();
+        return;
+      }
+      eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.teams) setTeams(data.teams); // Handle update
+        else setTeams(data); // Handle initial or direct array
+        setIsConnected(true);
+      };
+      
+      eventSource.onerror = () => {
+        eventSource.close();
+      };
+    })();
 
     return () => {
-      eventSource.close();
+      cancelled = true;
+      eventSource?.close();
     };
   }, [navigate]);
 
@@ -93,6 +114,120 @@ function AdminDashboard() {
       // Refresh on failure
       apiFetch('/api/teams').then(res => res.json()).then(setTeams);
     });
+  };
+
+  const uploadTeamImage = async (teamId, file) => {
+    if (!file) return;
+    const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // 2MB (server-enforced too)
+    if (file.size > MAX_IMAGE_BYTES) {
+      alert('이미지는 2MB 이하만 업로드할 수 있습니다.');
+      return;
+    }
+
+    const readAsDataUrl = (f) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('파일 읽기 실패'));
+      reader.readAsDataURL(f);
+    });
+
+    setUploadingTeamId(teamId);
+    try {
+      const dataUrl = await readAsDataUrl(file);
+      const res = await apiFetch(`/api/admin/team/${teamId}/image`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dataUrl })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || '업로드 실패');
+
+      setTeams(prev => prev.map(t => t.id === teamId ? { ...t, image_url: data.imageUrl } : t));
+    } catch (err) {
+      alert(err?.message || '업로드 실패');
+    } finally {
+      setUploadingTeamId(null);
+    }
+  };
+
+  const downloadStudentTemplate = async () => {
+    try {
+      const res = await apiFetch('/api/admin/students/template');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || '다운로드 실패');
+
+      const csv = data?.csv || 'grade,class_no,student_no,name\n';
+      const filename = data?.filename || 'students_template.csv';
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(err?.message || '다운로드 실패');
+    }
+  };
+
+  const decodeStudentCsvFile = async (file) => {
+    const ab = await file.arrayBuffer();
+    const decode = (enc) => {
+      try {
+        return new TextDecoder(enc).decode(ab);
+      } catch (e) {
+        return null;
+      }
+    };
+    const countReplacement = (text) => (text?.match(/\uFFFD/g) || []).length;
+
+    const utf8 = decode('utf-8') || '';
+    const euckr = decode('euc-kr') || decode('windows-949') || null;
+    if (!euckr) return utf8;
+
+    return countReplacement(euckr) < countReplacement(utf8) ? euckr : utf8;
+  };
+
+  const importStudentsCsv = async () => {
+    if (!studentCsvFile) return;
+
+    const confirmed = studentImportMode === 'replace'
+      ? window.confirm('학생 목록을 전체 교체할까요? (기존 학생 목록이 삭제됩니다)')
+      : true;
+    if (!confirmed) return;
+
+    setStudentImporting(true);
+    setStudentImportResult(null);
+
+    try {
+      const csvText = await decodeStudentCsvFile(studentCsvFile);
+      const res = await apiFetch('/api/admin/students/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          csvText,
+          mode: studentImportMode,
+          resetBoothUsage: studentResetUsage
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (data?.error === 'HAS_USAGE_DATA') {
+          throw new Error('부스 이용 기록이 있어서 전체 교체가 막혔습니다. "부스 이용 기록도 함께 초기화"를 체크하고 다시 업로드하세요.');
+        }
+        throw new Error(data?.error || '업로드 실패');
+      }
+      setStudentImportResult(data);
+      if (typeof data?.totalStudents === 'number') setStudentCount(data.totalStudents);
+      setStudentCsvFile(null);
+      alert('학생 CSV 반영 완료');
+    } catch (err) {
+      alert(err?.message || '업로드 실패');
+    } finally {
+      setStudentImporting(false);
+    }
   };
 
   const updateStatus = (teamId, status) => {
@@ -228,6 +363,52 @@ function AdminDashboard() {
       </div>
 
       <div className="card">
+        <h3 style={{ marginTop: 0 }}>Booth Ops 학생 CSV</h3>
+        <p style={{ color: '#888', marginTop: 0 }}>
+          CSV로 전교 학생 목록을 업로드하면 Booth Ops에서 학생 검색/체크가 가능합니다.
+        </p>
+
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '12px' }}>
+          <button className="btn btn-secondary btn-compact" onClick={downloadStudentTemplate}>CSV 양식 다운로드</button>
+          <span className="pill">현재 학생 수: {typeof studentCount === 'number' ? `${studentCount}명` : '불러오는 중...'}</span>
+        </div>
+
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <input
+            type="file"
+            accept=".csv,text/csv"
+            onChange={(e) => setStudentCsvFile(e.target.files?.[0] || null)}
+          />
+          <select value={studentImportMode} onChange={(e) => setStudentImportMode(e.target.value)} style={{ width: 'auto' }}>
+            <option value="replace">전체 교체</option>
+            <option value="merge">추가/수정(기존 유지)</option>
+          </select>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#cfd4e0' }}>
+            <input
+              type="checkbox"
+              checked={studentResetUsage}
+              onChange={(e) => setStudentResetUsage(e.target.checked)}
+              disabled={studentImportMode !== 'replace'}
+            />
+            부스 이용 기록도 함께 초기화
+          </label>
+          <button
+            className="btn btn-compact"
+            onClick={importStudentsCsv}
+            disabled={!studentCsvFile || studentImporting}
+          >
+            {studentImporting ? '업로드 중...' : 'CSV 업로드/반영'}
+          </button>
+        </div>
+
+        {studentImportResult && (
+          <pre style={{ marginTop: '12px', whiteSpace: 'pre-wrap', color: '#cfd4e0' }}>
+            {JSON.stringify(studentImportResult, null, 2)}
+          </pre>
+        )}
+      </div>
+
+      <div className="card">
         <h3>무대 관리 (Drag & Drop to Reorder)</h3>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
@@ -256,16 +437,59 @@ function AdminDashboard() {
                         </td>
                         <td style={{padding: '10px'}}>
                             {isEditing ? (
-                                <div style={{display:'flex', flexDirection:'column', gap:'6px'}}>
-                                    <label style={{fontSize:'0.8rem', color:'#aaa'}}>팀명</label>
-                                    <input value={editName} onChange={e => setEditName(e.target.value)} style={{marginBottom:'4px'}} />
-                                    <label style={{fontSize:'0.8rem', color:'#aaa'}}>무대 / 설명</label>
-                                    <textarea value={editDesc} rows="2" onChange={e => setEditDesc(e.target.value)} />
+                                <div style={{display:'flex', gap:'12px', alignItems:'flex-start'}}>
+                                  <img
+                                    src={team.image_url || "/images/coming-soon.svg"}
+                                    alt={team.name}
+                                    style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '10px', border: '1px solid #444' }}
+                                    onError={(e) => { e.target.onerror = null; e.target.src = "/images/coming-soon.svg"; }}
+                                  />
+                                  <div style={{display:'flex', flexDirection:'column', gap:'6px', flex: 1}}>
+                                      <label style={{fontSize:'0.8rem', color:'#aaa'}}>팀명</label>
+                                      <input value={editName} onChange={e => setEditName(e.target.value)} style={{marginBottom:'4px'}} />
+                                      <label style={{fontSize:'0.8rem', color:'#aaa'}}>무대 / 설명</label>
+                                      <textarea value={editDesc} rows="2" onChange={e => setEditDesc(e.target.value)} />
+
+                                      <div style={{display:'flex', gap:'8px', alignItems:'center', flexWrap:'wrap', marginTop:'6px'}}>
+                                        <input
+                                          type="file"
+                                          accept="image/png,image/jpeg,image/webp"
+                                          onChange={(e) => {
+                                            const file = e.target.files?.[0];
+                                            e.target.value = '';
+                                            uploadTeamImage(team.id, file);
+                                          }}
+                                        />
+                                        {uploadingTeamId === team.id && <span className="pill">업로드 중...</span>}
+                                      </div>
+                                  </div>
                                 </div>
                             ) : (
-                                <div onClick={() => startEdit(team)} style={{cursor:'pointer', borderBottom:'1px dashed #666', display:'inline-block'}}>
-                                    {team.name}
-                                    <div style={{fontSize: '0.8rem', color: '#888'}}>{team.description || '무대 설명이 없습니다.'}</div>
+                                <div style={{display:'flex', gap:'12px', alignItems:'flex-start'}}>
+                                  <img
+                                    src={team.image_url || "/images/coming-soon.svg"}
+                                    alt={team.name}
+                                    style={{ width: '64px', height: '64px', objectFit: 'cover', borderRadius: '10px', border: '1px solid #444' }}
+                                    onError={(e) => { e.target.onerror = null; e.target.src = "/images/coming-soon.svg"; }}
+                                  />
+                                  <div style={{ flex: 1 }}>
+                                    <div onClick={() => startEdit(team)} style={{cursor:'pointer', borderBottom:'1px dashed #666', display:'inline-block'}}>
+                                        {team.name}
+                                        <div style={{fontSize: '0.8rem', color: '#888'}}>{team.description || '무대 설명이 없습니다.'}</div>
+                                    </div>
+                                    <div style={{display:'flex', gap:'8px', alignItems:'center', flexWrap:'wrap', marginTop:'8px'}}>
+                                      <input
+                                        type="file"
+                                        accept="image/png,image/jpeg,image/webp"
+                                        onChange={(e) => {
+                                          const file = e.target.files?.[0];
+                                          e.target.value = '';
+                                          uploadTeamImage(team.id, file);
+                                        }}
+                                      />
+                                      {uploadingTeamId === team.id && <span className="pill">업로드 중...</span>}
+                                    </div>
+                                  </div>
                                 </div>
                             )}
                         </td>

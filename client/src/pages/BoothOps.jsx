@@ -1,7 +1,36 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Title,
+  Tooltip,
+  Legend,
+} from 'chart.js';
+import { Bar } from 'react-chartjs-2';
 import { apiFetch } from '../apiClient';
 
 const MAX_USAGE = 3;
+const VOID_WINDOW_MS = 2 * 60 * 1000;
+const SUPERADMIN_LABEL = '통합관리자';
+
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  Title,
+  Tooltip,
+  Legend
+);
+
+const parseDbTimestamp = (val) => {
+  if (!val) return null;
+  if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(val)) {
+    return new Date(val.replace(' ', 'T') + 'Z');
+  }
+  return new Date(val);
+};
 
 function BoothOps() {
   const [booths, setBooths] = useState([]);
@@ -22,6 +51,7 @@ function BoothOps() {
   });
   const [students, setStudents] = useState([]);
   const [summary, setSummary] = useState(null);
+  const [dashboard, setDashboard] = useState(null);
   const [filters, setFilters] = useState({ search: '', grade: '', class_no: '' });
   const [loginForm, setLoginForm] = useState({ className: '', password: '' });
   const [status, setStatus] = useState('');
@@ -30,6 +60,9 @@ function BoothOps() {
   const [isUsing, setIsUsing] = useState(null);
   const [voidingId, setVoidingId] = useState(null);
   const [isLoadingSummary, setIsLoadingSummary] = useState(false);
+  const [isLoadingDashboard, setIsLoadingDashboard] = useState(false);
+  const [pinEdits, setPinEdits] = useState({});
+  const [savingPinFor, setSavingPinFor] = useState(null);
 
   const persistSession = (nextSession) => {
     setSession(nextSession);
@@ -38,6 +71,7 @@ function BoothOps() {
     } else {
       localStorage.removeItem('booth_ops_session');
       setSummary(null);
+      setDashboard(null);
       setStudents([]);
     }
   };
@@ -81,6 +115,35 @@ function BoothOps() {
     loadStudents();
   }, [session?.token]);
 
+  // Super admin dashboard
+  const loadDashboard = async (silent = false) => {
+    if (!session?.token || !session?.isSuperAdmin) return;
+    if (!silent) setIsLoadingDashboard(true);
+    const res = await authFetch('/api/admin/booth-ops/dashboard');
+    if (res.status === 401) {
+      persistSession(null);
+      setError('세션이 만료되어 다시 로그인해주세요.');
+      setIsLoadingDashboard(false);
+      return;
+    }
+    const data = await res.json();
+    if (!res.ok) {
+      if (!silent) setError(data?.error || '대시보드 불러오기 실패');
+      if (!silent) setIsLoadingDashboard(false);
+      return;
+    }
+    setDashboard(data);
+    if (!silent) setIsLoadingDashboard(false);
+  };
+
+  useEffect(() => {
+    if (!session?.token || !session?.isSuperAdmin) return;
+    loadDashboard();
+    const interval = setInterval(() => loadDashboard(true), 7000);
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.token, session?.isSuperAdmin]);
+
   const loadSummary = async (silent = false) => {
     if (!session?.token || !selectedBooth) return;
     if (!silent) setIsLoadingSummary(true);
@@ -92,6 +155,14 @@ function BoothOps() {
       return;
     }
     const data = await res.json();
+    if (!res.ok) {
+      if (!silent) {
+        const msg = data?.error === 'FORBIDDEN' ? '이 부스를 조회할 권한이 없습니다.' : (data?.error || '통계 불러오기 실패');
+        setError(msg);
+      }
+      if (!silent) setIsLoadingSummary(false);
+      return;
+    }
     setSummary(data);
     if (!silent) setIsLoadingSummary(false);
   };
@@ -118,7 +189,7 @@ function BoothOps() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '로그인 실패');
-      const nextSession = { token: data.token, className: data.className, boothId: data.boothId };
+      const nextSession = { token: data.token, className: data.className, boothId: data.boothId, isSuperAdmin: !!data.isSuperAdmin };
       persistSession(nextSession);
       const fallbackBooth = data.boothId || selectedBooth || booths[0]?.id || '';
       setSelectedBooth(fallbackBooth);
@@ -180,7 +251,7 @@ function BoothOps() {
     }
     const data = await res.json();
     if (!res.ok) {
-      setError(data.error === 'VOID_WINDOW_EXPIRED' ? '1분이 지나 되돌릴 수 없습니다.' : (data.error || '되돌리기 실패'));
+      setError(data.error === 'VOID_WINDOW_EXPIRED' ? '2분이 지나 되돌릴 수 없습니다.' : (data.error || '되돌리기 실패'));
     } else {
       setStatus('가장 최근 체크를 되돌렸습니다.');
       await loadSummary(true);
@@ -203,18 +274,57 @@ function BoothOps() {
 
   const formatTime = (val) => {
     if (!val) return '';
-    const d = new Date(val);
+    const d = parseDbTimestamp(val);
     if (Number.isNaN(d.getTime())) return val;
     return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   };
 
   const canVoid = (entry) => {
     if (!entry?.used_at) return false;
-    return Date.now() - new Date(entry.used_at).getTime() <= 60 * 1000;
+    const usedAt = parseDbTimestamp(entry.used_at);
+    if (!usedAt || Number.isNaN(usedAt.getTime())) return false;
+    return Date.now() - usedAt.getTime() <= VOID_WINDOW_MS;
   };
 
   const lastEntry = summary?.recent?.[0];
   const canVoidLast = lastEntry && canVoid(lastEntry);
+
+  // Lock class admins to their own booth
+  useEffect(() => {
+    if (!session?.token) return;
+    if (session?.isSuperAdmin) return;
+    if (!session?.boothId) return;
+    if (selectedBooth !== session.boothId) setSelectedBooth(session.boothId);
+  }, [session?.token, session?.isSuperAdmin, session?.boothId, selectedBooth]);
+
+  const boothUsageChart = useMemo(() => {
+    if (!dashboard?.booths?.length) return null;
+    const sorted = [...dashboard.booths].sort((a, b) => a.id - b.id);
+    return {
+      data: {
+        labels: sorted.map(b => `${b.class_name} · ${b.name}`),
+        datasets: [
+          {
+            label: '총 이용(회)',
+            data: sorted.map(b => b.totalUsage),
+            backgroundColor: 'rgba(60,210,165,0.7)',
+            borderColor: 'rgba(60,210,165,1)',
+            borderWidth: 1,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+        },
+        scales: {
+          y: { beginAtZero: true, ticks: { precision: 0 } },
+        },
+      },
+    };
+  }, [dashboard]);
 
   if (!session?.token) {
     return (
@@ -231,6 +341,7 @@ function BoothOps() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px' }}>
               <select value={loginForm.className} onChange={e => setLoginForm(f => ({ ...f, className: e.target.value }))} required>
                 <option value="">학급 선택</option>
+                <option value={SUPERADMIN_LABEL}>{SUPERADMIN_LABEL}</option>
                 {booths.map(b => <option key={b.id} value={b.class_name}>{b.class_name}</option>)}
               </select>
               <input type="password" placeholder="비밀번호/PIN" value={loginForm.password} onChange={e => setLoginForm(f => ({ ...f, password: e.target.value }))} required />
@@ -243,27 +354,177 @@ function BoothOps() {
     );
   }
 
+  const availableBooths = session?.isSuperAdmin
+    ? booths
+    : booths.filter(b => b.id === session?.boothId);
+
+  const resetAllUsage = async () => {
+    if (!session?.isSuperAdmin) return;
+    const confirmed = window.confirm('전체 부스 이용 데이터를 초기화할까요? (되돌릴 수 없습니다)');
+    if (!confirmed) return;
+    setStatus('');
+    setError('');
+    try {
+      const res = await authFetch('/api/admin/booth-ops/reset', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '초기화 실패');
+      setStatus('이용 데이터 초기화 완료');
+      await loadDashboard(true);
+      await loadSummary(true);
+    } catch (err) {
+      setError(err?.message || '초기화 실패');
+    }
+  };
+
+  const saveAdminPin = async (className) => {
+    if (!session?.isSuperAdmin) return;
+    const password = (pinEdits?.[className] || '').trim();
+    if (!password) {
+      setError('새 PIN을 입력해주세요.');
+      return;
+    }
+    const confirmed = window.confirm(`${className} 관리자 PIN을 변경할까요? (기존 로그인은 종료됩니다)`);
+    if (!confirmed) return;
+
+    setSavingPinFor(className);
+    setStatus('');
+    setError('');
+    try {
+      const res = await authFetch(`/api/admin/booth-ops/booth-admins/${encodeURIComponent(className)}/password`, {
+        method: 'PUT',
+        body: JSON.stringify({ password })
+      });
+      if (res.status === 401) {
+        persistSession(null);
+        setError('세션이 만료되어 다시 로그인해주세요.');
+        return;
+      }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || '저장 실패');
+      setPinEdits(prev => ({ ...prev, [className]: '' }));
+      setStatus(`${className} PIN 변경 완료`);
+    } catch (err) {
+      setError(err?.message || '저장 실패');
+    } finally {
+      setSavingPinFor(null);
+    }
+  };
+
   return (
     <div className="container" style={{ maxWidth: '1200px' }}>
       <div className="title-row" style={{ alignItems: 'flex-end' }}>
         <div>
           <p className="section-sub" style={{ margin: 0 }}>반별 부스 운영 UX</p>
           <h2 style={{ margin: '4px 0' }}>Booth Ops</h2>
-        </div>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          <div className="chip chip--success">로그인: {session.className}</div>
-          <button className="btn btn-secondary btn-compact" onClick={() => persistSession(null)}>로그아웃</button>
-        </div>
-      </div>
+	        </div>
+		        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+		          <div className={`chip ${session?.isSuperAdmin ? 'chip--accent' : 'chip--success'}`}>로그인: {session.className}</div>
+		          <button className="btn btn-secondary btn-compact" onClick={() => persistSession(null)}>로그아웃</button>
+		        </div>
+		      </div>
 
-      <div className="card ops-card">
-        <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '12px' }}>
-          <div style={{ minWidth: '220px' }}>
-            <label className="section-sub" style={{ display: 'block', marginBottom: '6px' }}>운영 부스 선택</label>
-            <select value={selectedBooth || ''} onChange={e => setSelectedBooth(Number(e.target.value))}>
-              {booths.map(b => <option key={b.id} value={b.id}>{b.class_name} · {b.name}</option>)}
-            </select>
+      {session?.isSuperAdmin && (
+        <div className="card ops-card" style={{ marginBottom: '14px' }}>
+          <div className="title-row" style={{ justifyContent: 'space-between', alignItems: 'flex-end' }}>
+            <div>
+              <p className="section-sub" style={{ margin: 0 }}>교사용 통합관리자</p>
+              <h3 style={{ margin: '4px 0' }}>이용현황 대시보드</h3>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+              {isLoadingDashboard && <span className="pill">대시보드 새로고침...</span>}
+              <button className="btn btn-secondary btn-compact" onClick={() => loadDashboard()} style={{ padding: '8px 12px' }}>대시보드 새로고침</button>
+              <button className="btn btn-compact" onClick={resetAllUsage} style={{ padding: '8px 12px' }}>전체 초기화</button>
+            </div>
           </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '10px', marginTop: '12px' }}>
+            <div className="summary-card">
+              <p className="section-sub" style={{ margin: 0 }}>전체 이용</p>
+              <h3 style={{ margin: '4px 0' }}>{dashboard?.totalUsage ?? 0}회</h3>
+            </div>
+            <div className="summary-card">
+              <p className="section-sub" style={{ margin: 0 }}>참여 인원</p>
+              <h3 style={{ margin: '4px 0' }}>{dashboard?.uniqueStudents ?? 0}명</h3>
+            </div>
+            <div className="summary-card">
+              <p className="section-sub" style={{ margin: 0 }}>전체 학생</p>
+              <h3 style={{ margin: '4px 0' }}>{dashboard?.totalStudents ?? 0}명</h3>
+            </div>
+          </div>
+
+          {boothUsageChart && (
+            <div style={{ height: '260px', marginTop: '12px' }}>
+              <Bar data={boothUsageChart.data} options={boothUsageChart.options} />
+            </div>
+          )}
+
+	          {dashboard?.booths?.length ? (
+	            <div style={{ marginTop: '12px' }}>
+	              <div className="title-row" style={{ marginBottom: '6px' }}>
+	                <h3 style={{ margin: 0 }}>부스별 현황</h3>
+	              </div>
+	              <div className="table-scroll">
+	                <table className="ops-table">
+	                  <thead>
+	                    <tr>
+	                      <th>부스</th>
+	                      <th>총 이용</th>
+	                      <th>고유 인원</th>
+	                      <th>최근 이용</th>
+	                      <th>관리자 PIN</th>
+	                    </tr>
+	                  </thead>
+	                  <tbody>
+	                    {dashboard.booths
+	                      .slice()
+	                      .sort((a, b) => a.id - b.id)
+	                      .map(b => (
+	                        <tr key={b.id}>
+	                          <td><strong>{b.class_name}</strong><span className="muted"> · {b.name}</span></td>
+	                          <td>{b.totalUsage}회</td>
+	                          <td>{b.uniqueStudents}명</td>
+	                          <td className="muted">{b.lastUsedAt ? formatTime(b.lastUsedAt) : '-'}</td>
+	                          <td>
+	                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+	                              <input
+	                                type="password"
+	                                placeholder="새 PIN"
+	                                value={pinEdits?.[b.class_name] || ''}
+	                                onChange={e => setPinEdits(prev => ({ ...prev, [b.class_name]: e.target.value }))}
+	                                style={{ maxWidth: '140px' }}
+	                              />
+	                              <button
+	                                className="btn btn-secondary btn-compact"
+	                                onClick={() => saveAdminPin(b.class_name)}
+	                                disabled={savingPinFor === b.class_name}
+	                              >
+	                                {savingPinFor === b.class_name ? '저장 중...' : '저장'}
+	                              </button>
+	                            </div>
+	                          </td>
+	                        </tr>
+	                      ))}
+	                  </tbody>
+	                </table>
+	              </div>
+	            </div>
+	          ) : null}
+        </div>
+      )}
+
+	      <div className="card ops-card">
+	        <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '12px' }}>
+	          <div style={{ minWidth: '220px' }}>
+	            <label className="section-sub" style={{ display: 'block', marginBottom: '6px' }}>운영 부스 선택</label>
+	            <select
+	              value={selectedBooth || ''}
+	              onChange={e => setSelectedBooth(Number(e.target.value))}
+	              disabled={!session?.isSuperAdmin}
+	            >
+	              {!availableBooths.length && <option value="">부스 불러오는 중...</option>}
+	              {availableBooths.map(b => <option key={b.id} value={b.id}>{b.class_name} · {b.name}</option>)}
+	            </select>
+	          </div>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
             <span className="chip chip--warn">학생당 최대 {MAX_USAGE}회</span>
             {isLoadingSummary && <span className="pill">통계 새로고침...</span>}

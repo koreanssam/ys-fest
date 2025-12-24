@@ -30,3 +30,10 @@ server/fest.db
 server/fest.db-wal
 server/fest.db-shm
 server/__tests__/tmp
+
+# Local runtime pid/log (do not push)
+server-*.pid
+server-*.log
+
+# Runtime uploads (do not push)
+public/images/teams/uploads/

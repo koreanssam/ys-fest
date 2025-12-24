@@ -2,6 +2,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const {
     initDB,
@@ -18,6 +19,7 @@ const {
     updateTeamStatus,
     addTeam,
     updateTeam,
+    updateTeamImage,
     setTeamJudgeExempt,
     updateBooth,
     updateTeamOrder,
@@ -25,15 +27,23 @@ const {
     resetStats,
     // booth ops
     getStudents,
+    getStudentCount,
     getStudentById,
     loginBoothAdmin,
+    setBoothAdminPassword,
+    resetBoothOpsUsage,
+    getStudentsCsvTemplate,
+    importStudentsFromCsvText,
     useBooth,
     voidBoothUsage,
     getBoothUsageSummary,
-    getBoothUsageById
+    getBoothUsageById,
+    getBoothOpsDashboard
 } = require('./db');
 
 const DIST_PATH = path.join(__dirname, '..', 'client', 'dist');
+const BOOTH_SUPERADMIN_NAME = process.env.BOOTH_SUPERADMIN_NAME || '통합관리자';
+const VOID_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
 
 // In-memory vote buffer for batching
 let voteBuffer = {}; // { teamId: count }
@@ -52,6 +62,7 @@ function issueBoothAdminToken(admin, boothId) {
         token,
         adminId: admin.id,
         className: admin.class_name,
+        isSuperAdmin: admin.class_name === BOOTH_SUPERADMIN_NAME,
         defaultBoothId: boothId || null,
         createdAt: Date.now(),
         expiresAt: Date.now() + ADMIN_TOKEN_TTL
@@ -74,6 +85,26 @@ function requireBoothAdmin(req, res, next) {
     return next();
 }
 
+function requireBoothSuperAdmin(req, res, next) {
+    if (!req.boothAdmin?.isSuperAdmin) return res.status(403).json({ error: 'FORBIDDEN' });
+    return next();
+}
+
+function canAccessBooth(session, boothId) {
+    if (!session) return false;
+    if (session.isSuperAdmin) return true;
+    if (!session.defaultBoothId) return false;
+    return session.defaultBoothId === boothId;
+}
+
+function parseDbTimestamp(value) {
+    if (!value) return null;
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) {
+        return new Date(value.replace(' ', 'T') + 'Z'); // SQLite CURRENT_TIMESTAMP is UTC
+    }
+    return new Date(value);
+}
+
 function notifyAdmins() {
     const teams = getTeams();
     const data = JSON.stringify(teams);
@@ -87,7 +118,7 @@ function createApp(options = {}) {
     const app = express();
 
     app.use(cors());
-    app.use(bodyParser.json());
+    app.use(bodyParser.json({ limit: '10mb' }));
 
     app.use(express.static('public'));
     app.use(express.static(DIST_PATH));
@@ -121,8 +152,62 @@ function createApp(options = {}) {
             token: session.token,
             adminId: session.adminId,
             className: session.className,
+            isSuperAdmin: session.isSuperAdmin,
             boothId: session.defaultBoothId
         });
+    });
+
+    api.get('/admin/booth-ops/dashboard', requireBoothAdmin, requireBoothSuperAdmin, (req, res) => {
+        res.json(getBoothOpsDashboard());
+    });
+
+    api.post('/admin/booth-ops/reset', requireBoothAdmin, requireBoothSuperAdmin, (req, res) => {
+        resetBoothOpsUsage();
+        res.json({ success: true });
+    });
+
+    api.put('/admin/booth-ops/booth-admins/:className/password', requireBoothAdmin, requireBoothSuperAdmin, (req, res) => {
+        const className = req.params.className;
+        const { password } = req.body || {};
+        if (!className) return res.status(400).json({ error: 'INVALID_CLASS' });
+        if (!password) return res.status(400).json({ error: 'MISSING_PASSWORD' });
+        if (className === BOOTH_SUPERADMIN_NAME) return res.status(400).json({ error: 'CANNOT_CHANGE_SUPERADMIN' });
+
+        const booth = getBoothByClassName(className);
+        if (!booth) return res.status(404).json({ error: 'NOT_FOUND' });
+
+        setBoothAdminPassword(className, password);
+
+        // Invalidate existing sessions for that class admin
+        for (const [token, session] of boothAdminTokens.entries()) {
+            if (session?.className === className) boothAdminTokens.delete(token);
+        }
+
+        res.json({ success: true });
+    });
+
+    // Admin: Booth Ops student CSV management
+    api.get('/admin/students/template', (req, res) => {
+        res.json({
+            filename: 'students_template.csv',
+            csv: getStudentsCsvTemplate()
+        });
+    });
+
+    api.get('/admin/students/stats', (req, res) => {
+        res.json({ totalStudents: getStudentCount() });
+    });
+
+    api.post('/admin/students/import', (req, res) => {
+        const { csvText, mode, resetBoothUsage } = req.body || {};
+        if (!csvText || typeof csvText !== 'string') return res.status(400).json({ error: 'MISSING_CSV' });
+
+        const result = importStudentsFromCsvText(csvText, { mode, resetBoothUsage });
+        if (!result.success) {
+            if (result.error === 'HAS_USAGE_DATA') return res.status(409).json(result);
+            return res.status(400).json(result);
+        }
+        res.json(result);
     });
 
     api.get('/teams', (req, res) => res.json(getTeams()));
@@ -167,6 +252,63 @@ function createApp(options = {}) {
             console.error("Add Team Error:", e);
             res.status(500).json({ success: false, error: e.message });
         }
+    });
+
+    api.put('/admin/team/:id/image', (req, res) => {
+        const teamId = parseInt(req.params.id, 10);
+        if (Number.isNaN(teamId)) return res.status(400).json({ error: 'INVALID_TEAM' });
+
+        const { dataUrl } = req.body || {};
+        if (!dataUrl || typeof dataUrl !== 'string') return res.status(400).json({ error: 'MISSING_IMAGE' });
+
+        const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);
+        if (!match) return res.status(400).json({ error: 'INVALID_IMAGE_FORMAT' });
+
+        const mime = match[1];
+        const base64 = match[2];
+        let buf;
+        try {
+            buf = Buffer.from(base64, 'base64');
+        } catch (e) {
+            return res.status(400).json({ error: 'INVALID_BASE64' });
+        }
+        if (!buf?.length) return res.status(400).json({ error: 'INVALID_IMAGE' });
+
+        const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // 2MB
+        if (buf.length > MAX_IMAGE_BYTES) return res.status(413).json({ error: 'IMAGE_TOO_LARGE' });
+
+        const ext = mime === 'image/png' ? 'png' : (mime === 'image/webp' ? 'webp' : 'jpg');
+
+        const uploadDir = process.env.TEAM_IMAGE_UPLOAD_DIR
+            ? path.resolve(process.env.TEAM_IMAGE_UPLOAD_DIR)
+            : path.join(__dirname, '..', 'public', 'images', 'teams', 'uploads');
+
+        fs.mkdirSync(uploadDir, { recursive: true });
+
+        // Keep only one file per team (avoid disk fill); remove other ext variants.
+        ['png', 'jpg', 'webp'].forEach(candidateExt => {
+            const candidatePath = path.join(uploadDir, `team-${teamId}.${candidateExt}`);
+            try { fs.unlinkSync(candidatePath); } catch (e) { /* ignore */ }
+        });
+
+        const filename = `team-${teamId}.${ext}`;
+        const filePath = path.join(uploadDir, filename);
+        try {
+            fs.writeFileSync(filePath, buf);
+        } catch (e) {
+            console.error('Failed to write team image:', e);
+            return res.status(500).json({ error: 'UPLOAD_FAILED' });
+        }
+
+        const imageUrl = `/images/teams/uploads/${filename}?v=${Date.now()}`;
+        const result = updateTeamImage(teamId, imageUrl);
+        if (!result?.changes) {
+            try { fs.unlinkSync(filePath); } catch (e) { /* ignore */ }
+            return res.status(404).json({ error: 'NOT_FOUND' });
+        }
+
+        notifyAdmins();
+        res.json({ success: true, imageUrl });
     });
 
     api.put('/admin/team/reorder', (req, res) => {
@@ -214,6 +356,7 @@ function createApp(options = {}) {
     api.get('/booths/:id/usages/summary', requireBoothAdmin, (req, res) => {
         const boothId = parseInt(req.params.id, 10);
         if (Number.isNaN(boothId)) return res.status(400).json({ error: 'INVALID_BOOTH' });
+        if (!canAccessBooth(req.boothAdmin, boothId)) return res.status(403).json({ error: 'FORBIDDEN' });
         const booth = getBoothById(boothId);
         if (!booth) return res.status(404).json({ error: 'NOT_FOUND' });
         const summary = getBoothUsageSummary(boothId);
@@ -223,6 +366,7 @@ function createApp(options = {}) {
     api.post('/booths/:id/use', requireBoothAdmin, (req, res) => {
         const boothId = parseInt(req.params.id, 10);
         if (Number.isNaN(boothId)) return res.status(400).json({ error: 'INVALID_BOOTH' });
+        if (!canAccessBooth(req.boothAdmin, boothId)) return res.status(403).json({ error: 'FORBIDDEN' });
         const booth = getBoothById(boothId);
         if (!booth) return res.status(404).json({ error: 'NOT_FOUND' });
         const { studentId } = req.body || {};
@@ -249,14 +393,15 @@ function createApp(options = {}) {
         const boothId = parseInt(req.params.id, 10);
         const usageId = parseInt(req.params.usageId, 10);
         if (Number.isNaN(boothId) || Number.isNaN(usageId)) return res.status(400).json({ error: 'INVALID_REQUEST' });
+        if (!canAccessBooth(req.boothAdmin, boothId)) return res.status(403).json({ error: 'FORBIDDEN' });
         const booth = getBoothById(boothId);
         if (!booth) return res.status(404).json({ error: 'NOT_FOUND' });
         const usage = getBoothUsageById(usageId);
         if (!usage || usage.booth_id !== boothId) return res.status(404).json({ error: 'NOT_FOUND' });
-        const usedAt = new Date(usage.used_at);
-        if (Number.isNaN(usedAt.getTime())) return res.status(400).json({ error: 'INVALID_USAGE' });
+        const usedAt = parseDbTimestamp(usage.used_at);
+        if (!usedAt || Number.isNaN(usedAt.getTime())) return res.status(400).json({ error: 'INVALID_USAGE' });
         const now = Date.now();
-        if (now - usedAt.getTime() > 60 * 1000) return res.status(400).json({ error: 'VOID_WINDOW_EXPIRED' });
+        if (now - usedAt.getTime() > VOID_WINDOW_MS) return res.status(400).json({ error: 'VOID_WINDOW_EXPIRED' });
         const result = voidBoothUsage(usageId, req.boothAdmin.adminId, req.body?.reason || '');
         if (!result.success) return res.status(400).json({ error: 'VOID_FAILED' });
         res.json({ success: true });

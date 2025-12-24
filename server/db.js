@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs');
 
 const MAX_USAGE_PER_BOOTH = 3;
+const BOOTH_SUPERADMIN_NAME = process.env.BOOTH_SUPERADMIN_NAME || '통합관리자';
+const BOOTH_SUPERADMIN_PASSWORD = process.env.BOOTH_SUPERADMIN_PASSWORD || 'dudtkswnd1!';
 const resolvedPath = process.env.DB_PATH ? path.resolve(process.env.DB_PATH) : path.resolve(__dirname, 'fest.db');
 fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
 const db = new Database(resolvedPath);
@@ -271,19 +273,25 @@ function seedStudents() {
 }
 
 function seedBoothAdmins() {
-    const adminCount = db.prepare('SELECT count(*) as c FROM booth_admins').get().c;
-    if (adminCount > 0) return;
     const booths = getBooths();
     if (!booths.length) return;
 
-    const insert = db.prepare('INSERT INTO booth_admins (class_name, password) VALUES (?, ?)');
+    const insert = db.prepare('INSERT OR IGNORE INTO booth_admins (class_name, password) VALUES (?, ?)');
     const tx = db.transaction((rows) => {
         rows.forEach(row => insert.run(row.class_name, row.password));
     });
 
     // Default password is deliberately simple for on-site ops; change in DB if needed.
     tx(booths.map(b => ({ class_name: b.class_name, password: '0000' })));
-    console.log(`[DB] Seeded ${booths.length} booth admins with default PINs`);
+
+    // Ensure a single super admin exists for teachers/integrated ops.
+    db.prepare(`
+        INSERT INTO booth_admins (class_name, password)
+        VALUES (?, ?)
+        ON CONFLICT(class_name) DO UPDATE SET password = excluded.password
+    `).run(BOOTH_SUPERADMIN_NAME, BOOTH_SUPERADMIN_PASSWORD);
+
+    console.log(`[DB] Ensured booth admins for ${booths.length} booths + super admin`);
 }
 
 function getTeams() {
@@ -364,6 +372,10 @@ function updateTeam(id, name, description) {
     db.prepare('UPDATE teams SET name = ?, description = ? WHERE id = ?').run(name, description, id);
 }
 
+function updateTeamImage(id, imageUrl) {
+    return db.prepare('UPDATE teams SET image_url = ? WHERE id = ?').run(imageUrl, id);
+}
+
 function setTeamJudgeExempt(id, exempt) {
     db.prepare('UPDATE teams SET judge_exempt = ? WHERE id = ?').run(exempt ? 1 : 0, id);
 }
@@ -413,6 +425,10 @@ function getStudents(filters = {}) {
     return db.prepare(query).all(...params);
 }
 
+function getStudentCount() {
+    return db.prepare('SELECT COUNT(*) as c FROM students').get().c;
+}
+
 function getStudentById(id) {
     return db.prepare('SELECT * FROM students WHERE id = ?').get(id);
 }
@@ -423,6 +439,202 @@ function loginBoothAdmin(className, password) {
 
 function getBoothUsageById(id) {
     return db.prepare('SELECT * FROM booth_usages WHERE id = ?').get(id);
+}
+
+function setBoothAdminPassword(className, password) {
+    db.prepare(`
+        INSERT INTO booth_admins (class_name, password)
+        VALUES (?, ?)
+        ON CONFLICT(class_name) DO UPDATE SET password = excluded.password
+    `).run(className, password);
+    return { success: true };
+}
+
+function resetBoothOpsUsage() {
+    db.prepare('DELETE FROM booth_usages_void').run();
+    db.prepare('DELETE FROM booth_usages').run();
+    return { success: true };
+}
+
+function getBoothOpsUsageCount() {
+    return db.prepare('SELECT COUNT(*) as c FROM booth_usages').get().c;
+}
+
+function getStudentsCsvTemplate() {
+    const header = 'grade,class_no,student_no,name';
+    const example = '1,1,1,홍길동';
+    return `${header}\n${example}\n`;
+}
+
+function normalizeCsvText(csvText) {
+    return String(csvText || '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n');
+}
+
+function parseStudentsCsvText(csvText) {
+    const text = normalizeCsvText(csvText).trim();
+    if (!text) return { rows: [], errors: [{ line: 0, reason: 'EMPTY_FILE' }] };
+
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return { rows: [], errors: [{ line: 0, reason: 'EMPTY_FILE' }] };
+
+    const normalizeHeaderKey = (value) =>
+        String(value || '')
+            .replace(/^\uFEFF/, '')
+            .trim()
+            .toLowerCase()
+            .replace(/[\s_-]+/g, '');
+
+    const headerKeys = lines[0]
+        .split(',')
+        .map(normalizeHeaderKey);
+
+    const aliases = {
+        grade: ['grade', '학년'],
+        class_no: ['classno', 'class', '반', '학급'],
+        student_no: ['studentno', 'student', '번호', '학생번호'],
+        name: ['name', '이름', '성명']
+    };
+
+    const findIndex = (keys, candidates) => {
+        const normalized = candidates.map(normalizeHeaderKey);
+        return keys.findIndex(k => normalized.includes(k));
+    };
+
+    const idxGrade = findIndex(headerKeys, aliases.grade);
+    const idxClass = findIndex(headerKeys, aliases.class_no);
+    const idxStudent = findIndex(headerKeys, aliases.student_no);
+    const idxName = findIndex(headerKeys, aliases.name);
+
+    const missing = [];
+    if (idxGrade < 0) missing.push('grade');
+    if (idxClass < 0) missing.push('class_no');
+    if (idxStudent < 0) missing.push('student_no');
+    if (idxName < 0) missing.push('name');
+    if (missing.length) {
+        return {
+            rows: [],
+            errors: [{
+                line: 1,
+                reason: 'INVALID_HEADER',
+                missing
+            }]
+        };
+    }
+
+    const rows = [];
+    const errors = [];
+    const seen = new Set();
+
+    for (let i = 1; i < lines.length; i++) {
+        const lineNo = i + 1; // 1-based, including header
+        const raw = lines[i];
+        const parts = raw.split(',').map(p => p.trim());
+        const readCell = (idx) => (idx >= 0 && idx < parts.length ? parts[idx] : '');
+
+        const gradeRaw = readCell(idxGrade);
+        const classRaw = readCell(idxClass);
+        const studentRaw = readCell(idxStudent);
+        const nameRaw = idxName === parts.length - 1
+            ? parts.slice(idxName).join(',').trim()
+            : readCell(idxName);
+
+        const grade = parseInt(gradeRaw, 10);
+        const class_no = parseInt(classRaw, 10);
+        const student_no = parseInt(studentRaw, 10);
+        const name = String(nameRaw || '').trim();
+
+        if (!Number.isInteger(grade) || !Number.isInteger(class_no) || !Number.isInteger(student_no) || !name) {
+            errors.push({
+                line: lineNo,
+                reason: 'INVALID_ROW',
+                row: { grade: gradeRaw, class_no: classRaw, student_no: studentRaw, name: nameRaw }
+            });
+            continue;
+        }
+
+        const key = `${grade}-${class_no}-${student_no}`;
+        if (seen.has(key)) {
+            errors.push({ line: lineNo, reason: 'DUPLICATE_ROW', key });
+            continue;
+        }
+        seen.add(key);
+
+        rows.push({ grade, class_no, student_no, name });
+    }
+
+    return { rows, errors };
+}
+
+function importStudentsFromCsvText(csvText, options = {}) {
+    const mode = options.mode === 'merge' ? 'merge' : 'replace';
+    const resetBoothUsage = !!options.resetBoothUsage;
+
+    const parsed = parseStudentsCsvText(csvText);
+    if (!parsed.rows.length) {
+        return {
+            success: false,
+            error: parsed.errors?.[0]?.reason || 'NO_ROWS',
+            details: parsed.errors || []
+        };
+    }
+
+    const usageCount = getBoothOpsUsageCount();
+    if (mode === 'replace' && usageCount > 0 && !resetBoothUsage) {
+        return { success: false, error: 'HAS_USAGE_DATA', usageCount };
+    }
+
+    const insert = db.prepare('INSERT INTO students (grade, class_no, student_no, name) VALUES (?, ?, ?, ?)');
+    const update = db.prepare('UPDATE students SET name = ? WHERE id = ?');
+    const find = db.prepare('SELECT id, name FROM students WHERE grade = ? AND class_no = ? AND student_no = ?');
+
+    let inserted = 0;
+    let updated = 0;
+    let deleted = 0;
+
+    const tx = db.transaction(() => {
+        if (mode === 'replace') {
+            if (resetBoothUsage) resetBoothOpsUsage();
+            deleted = db.prepare('DELETE FROM students').run().changes;
+            parsed.rows.forEach(r => {
+                insert.run(r.grade, r.class_no, r.student_no, r.name);
+                inserted += 1;
+            });
+            return;
+        }
+
+        // merge
+        parsed.rows.forEach(r => {
+            const existing = find.get(r.grade, r.class_no, r.student_no);
+            if (!existing) {
+                insert.run(r.grade, r.class_no, r.student_no, r.name);
+                inserted += 1;
+                return;
+            }
+            const prevName = String(existing.name || '').trim();
+            if (prevName !== r.name) {
+                update.run(r.name, existing.id);
+                updated += 1;
+            }
+        });
+    });
+
+    if (typeof tx.immediate === 'function') tx.immediate();
+    else tx();
+
+    return {
+        success: true,
+        mode,
+        resetBoothUsage: mode === 'replace' ? resetBoothUsage : false,
+        usageCountBefore: usageCount,
+        parsed: { rows: parsed.rows.length, errors: parsed.errors.length },
+        inserted,
+        updated,
+        deleted,
+        totalStudents: getStudentCount(),
+        errors: parsed.errors.slice(0, 50)
+    };
 }
 
 function useBooth(boothId, studentId, adminId) {
@@ -521,6 +733,62 @@ function getBoothUsageSummary(boothId) {
     };
 }
 
+function getBoothOpsDashboard() {
+    const totalStudents = db.prepare('SELECT COUNT(*) as c FROM students').get().c;
+    const totalUsage = db.prepare('SELECT COUNT(*) as c FROM booth_usages').get().c;
+    const uniqueStudents = db.prepare('SELECT COUNT(DISTINCT student_id) as c FROM booth_usages').get().c;
+
+    const usageByBooth = Object.fromEntries(
+        db.prepare('SELECT booth_id, COUNT(*) as c FROM booth_usages GROUP BY booth_id').all().map(r => [r.booth_id, r.c])
+    );
+    const uniqueByBooth = Object.fromEntries(
+        db.prepare('SELECT booth_id, COUNT(DISTINCT student_id) as c FROM booth_usages GROUP BY booth_id').all().map(r => [r.booth_id, r.c])
+    );
+    const lastUsedByBooth = Object.fromEntries(
+        db.prepare('SELECT booth_id, MAX(used_at) as last_used_at FROM booth_usages GROUP BY booth_id').all().map(r => [r.booth_id, r.last_used_at])
+    );
+
+    const booths = getBooths().map(b => ({
+        id: b.id,
+        class_name: b.class_name,
+        name: b.name,
+        totalUsage: usageByBooth[b.id] || 0,
+        uniqueStudents: uniqueByBooth[b.id] || 0,
+        lastUsedAt: lastUsedByBooth[b.id] || null
+    }));
+
+    const recent = db.prepare(`
+        SELECT u.id, u.booth_id, u.student_id, u.admin_id, u.used_at,
+               b.class_name as booth_class, b.name as booth_name,
+               s.name as student_name, s.grade, s.class_no, s.student_no,
+               ba.class_name as admin_class
+        FROM booth_usages u
+        JOIN booths b ON u.booth_id = b.id
+        JOIN students s ON u.student_id = s.id
+        LEFT JOIN booth_admins ba ON u.admin_id = ba.id
+        ORDER BY u.used_at DESC, u.id DESC
+        LIMIT 50
+    `).all();
+
+    const usageByStudent = db.prepare(`
+        SELECT s.id as student_id, s.grade, s.class_no, s.student_no, s.name, COUNT(*) as count
+        FROM booth_usages u
+        JOIN students s ON u.student_id = s.id
+        GROUP BY s.id
+        ORDER BY count DESC, s.grade ASC, s.class_no ASC, s.student_no ASC
+        LIMIT 20
+    `).all();
+
+    return {
+        totalStudents,
+        totalUsage,
+        uniqueStudents,
+        booths,
+        recent,
+        usageByStudent
+    };
+}
+
 module.exports = {
     initDB,
     getTeams,
@@ -536,6 +804,7 @@ module.exports = {
     updateTeamStatus,
     addTeam,
     updateTeam,
+    updateTeamImage,
     setTeamJudgeExempt,
     updateBooth,
     updateTeamOrder,
@@ -543,10 +812,17 @@ module.exports = {
     resetStats,
     // booth ops
     getStudents,
+    getStudentCount,
     getStudentById,
     loginBoothAdmin,
+    setBoothAdminPassword,
+    resetBoothOpsUsage,
+    getBoothOpsUsageCount,
+    getStudentsCsvTemplate,
+    importStudentsFromCsvText,
     useBooth,
     voidBoothUsage,
     getBoothUsageSummary,
-    getBoothUsageById
+    getBoothUsageById,
+    getBoothOpsDashboard
 };
